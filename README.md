@@ -55,6 +55,22 @@ patch_hash {
 - 替换后返回 `new_file_hash` 与 `line_shift`，连续修改时不必整段重读。
 - CRLF 文件按原风格写回；末行无换行符的状态保持。
 
+## 锚点核实（每轮自动）
+
+`read_hash` 发出的每个锚点会登记下来，之后每次模型请求前（`agent/request`）复核一次，只覆盖**最近 3 个用户回合**内的文件：
+
+```
+stat 预筛（微秒级，不读文件）
+├─ 版本没变            → 什么都不做
+└─ 版本变了 → 算 sha256
+   ├─ 内容相同（touch / 重新构建） → 只补发 fs/observed 刷新策略底账，上下文零改动
+   └─ 内容真变了                    → 把当初那条 read 结果原地替换成「已失效 + 新旧 hash + 请重读」
+```
+
+第二行是关键：内置的 stat 版本守卫会把「内容没变但 mtime 变了」误判为外部修改，这里用内容哈希纠正它，模型不必因为一次 rebuild 就重读整个文件。
+
+工具自己改过的文件（`patch_hash`、内置 `write`/`edit`）会先通过 `fs/observed` 把对应锚点作废，**不会被当成外部变更回报给模型**。
+
 ## 实现要点
 
 - 所有读写走 `ctx.fs`，不直接碰 `node:fs`，沙箱与远端后端仍然有效。
@@ -72,12 +88,22 @@ patch_hash {
 - `replace: ""` 删除区间，文件内容与行位移正确
 - 写入确实经过 `replaceIfVersion` intent（stub 测试断言）
 
-离线测试：`npm test` — 27 个用例（核心逻辑 17 + 工具胶水 10），全部通过。
+锚点核实也做了真机验证：读文件 → 用 bash 在 `ctx.fs` 之外改写内容 → 下一次模型请求前，会话日志里出现
+
+```
+tool/result seq=1055  surfaceOp={"op":"replace","startSeq":1046,"endSeq":1046}  sources=[1046]
+→ "[line-patch] …/line-patch-reval.txt was modified after it was read
+   (file_hash 4cdfa7d498707b8f -> 417e4745306cbe22). … call read_hash again before patching."
+```
+
+即原来的 read 结果（seq 1046）被准确替换。
+
+离线测试：`npm test` — 32 个用例（核心逻辑 17 + 工具胶水 10 + 锚点核实 5），全部通过。
 
 ## 尚未实现
 
-- **每轮锚点核实**：原设计的「3 轮窗口内 stat 预筛 → sha256 复核 → 内容未变则刷新 `fs/observed`、内容变了则把那段 read 结果标记作废」还没接进来。需要先在真实宿主验证两个 API：`agent/pre-step` 的钩子形状，以及在钩子里能否做 `session.append` + `surfaceOp.op='replace'`。
 - `presentCall` / `presentResult` 的 diff 卡片（目前是纯文本渲染）。
+- 只核对「本会话登记过的、3 个用户回合内」的文件；更早的锚点按设计丢弃，不做长期追踪。
 
 ## 已知限制
 
