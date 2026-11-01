@@ -1,2 +1,5 @@
 node_modules/
+.worktree/
+.codegraph/
 *.log
+.DS_Store
