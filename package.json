@@ -1,7 +1,15 @@
 {
   "name": "dsh-line-patch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Anchored file editing for DeepSeek Harness: read_hash hands out per-line and whole-file hashes, patch_hash rewrites a line range only when the whole file and both boundary lines still match.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kingofpowers/dsh-line-patch.git"
+  },
+  "homepage": "https://github.com/kingofpowers/dsh-line-patch#readme",
+  "bugs": {
+    "url": "https://github.com/kingofpowers/dsh-line-patch/issues"
+  },
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -40,5 +48,11 @@
     "test": "node --test test/*.test.mjs",
     "check": "node --check lib/core.js && node --check lib/index.js"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "author": "kingofpowers",
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
 }
