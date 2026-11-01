@@ -1,0 +1,44 @@
+{
+  "name": "dsh-line-patch",
+  "version": "0.1.0",
+  "description": "Anchored file editing for DeepSeek Harness: read_hash hands out per-line and whole-file hashes, patch_hash rewrites a line range only when the whole file and both boundary lines still match.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "edit",
+    "patch",
+    "hash",
+    "anchor"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "manifestVersion": 1
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check lib/core.js && node --check lib/index.js"
+  },
+  "license": "MIT"
+}
