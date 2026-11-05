@@ -1,4 +1,4 @@
-# Anchored line-range editing: read_hash / patch_hash.
+# Anchored line-range editing: annotates read/write/edit results with a file hash and adds the patch tool.
 - insert:
     - id: line-patch
       name: dsh-line-patch

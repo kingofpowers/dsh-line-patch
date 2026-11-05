@@ -1,7 +1,7 @@
 /** Anchor revalidation: the per-request file check that keeps read results honest. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
@@ -12,6 +12,7 @@ function makeHost() {
   const listeners = new Map()
   const emitted = []
   const appended = []
+  let reads = 0
   const session = {
     append: (...args) => { appended.push(args); return { seq: 999 } },
     eventAt: (seq) => ({ seq, data: { turn: 1, step: 1, message: { id: 'm', role: 'tool', content: [] } } }),
@@ -32,7 +33,7 @@ function makeHost() {
         if (!stats) return undefined
         return { type: 'file', size: stats.size, version: `${stats.size}:${stats.mtimeMs}` }
       },
-      async readText(target) { return readFile(target.targetKey, 'utf8') },
+      async readText(target) { reads += 1; return readFile(target.targetKey, 'utf8') },
       async writeText(target, content) {
         await writeFile(target.targetKey, content)
         const after = await import('node:fs/promises').then(m => m.stat(target.targetKey))
@@ -49,7 +50,7 @@ function makeHost() {
     for (const handler of listeners.get(name) ?? []) result = await handler(...args)
     return result
   }
-  return { ctx, tools, emitted, appended, session, fire }
+  return { ctx, tools, emitted, appended, session, fire, reads: () => reads }
 }
 
 /** Create a temp file bound to a stub host. */
@@ -80,14 +81,15 @@ test('an untouched file is not re-read and nothing is rewritten', async () => {
   const { file, host } = await fixture('a\nb\n')
   await readAnchor(host, file)
   const appendsBefore = host.appended.length
+  const readsBefore = host.reads()
   await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
   assert.equal(host.appended.length, appendsBefore)
+  assert.equal(host.reads(), readsBefore, 'the stat prefilter must skip the file read')
 })
 
-test('a stat change with identical content refreshes the observation and keeps the anchors', async () => {
+test('a stat change with identical content refreshes the observation exactly once', async () => {
   const { file, host } = await fixture('a\nb\n')
   await readAnchor(host, file)
-  // Same bytes, newer mtime: exactly the rebuild/touch case the stat guard mishandles.
   const later = new Date(Date.now() + 5000)
   await utimes(file, later, later)
   const appendsBefore = host.appended.length
@@ -95,6 +97,10 @@ test('a stat change with identical content refreshes the observation and keeps t
   assert.equal(host.appended.length, appendsBefore, 'no surface rewrite for unchanged content')
   const observed = host.emitted.filter(([eventName]) => eventName === 'fs/observed')
   assert.ok(observed.length >= 1, 'the refresh emits an observation')
+  // The stored version must have moved, or the next turn would re-read and re-emit.
+  const readsAfterRefresh = host.reads()
+  await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
+  assert.equal(host.reads(), readsAfterRefresh, 'the refreshed version must be remembered')
 })
 
 test('a real content change rewrites the stale read result', async () => {
@@ -112,6 +118,29 @@ test('a real content change rewrites the stale read result', async () => {
   assert.match(text, /read it again/)
 })
 
+test('a tool-mediated write clears the anchor so no stale notice follows', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await readAnchor(host, file)
+  await writeFile(file, 'a\nB\n')
+  // The built-in write reports the new version on the observation channel.
+  const stats = await stat(file)
+  await host.fire('fs/observed', { targetKey: file, displayPath: file },
+    { kind: 'present', version: `${stats.size}:${stats.mtimeMs}` })
+  const appendsBefore = host.appended.length
+  await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
+  assert.equal(host.appended.length, appendsBefore, 'the write already carries the new hash')
+})
+
+test('a stale read result is replaced once, not on every turn', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await readAnchor(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
+  assert.equal(host.appended.length, 1)
+  await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
+  assert.equal(host.appended.length, 1, 'the replaced anchor must be dropped')
+})
+
 test('an anchor older than the turn window is dropped without any I/O', async () => {
   const { file, host } = await fixture('a\nb\n')
   await readAnchor(host, file)
@@ -127,7 +156,7 @@ test('an anchor older than the turn window is dropped without any I/O', async ()
 test('patch refreshes the anchor so its own write is not reported as external', async () => {
   const { file, host } = await fixture('a\nb\n')
   const decision = await readAnchor(host, file)
-  const hash = decision.content.at(-1).text.replace('file_hash: ', '')
+  const hash = /(?:^|\n)file_hash: ([0-9a-f]+)$/.exec(decision.content.at(-1).text)?.[1]
   await host.tools.get('patch').execute({
     file_path: file,
     file_hash: hash,

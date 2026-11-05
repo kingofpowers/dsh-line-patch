@@ -46,6 +46,11 @@ test('file hash is a 16 char sha256 prefix and tracks content', () => {
   assert.equal(fileHash(SAMPLE), fileHash(Buffer.from(SAMPLE)))
 })
 
+test('file hash is the sha256 prefix, pinned literally', () => {
+  assert.equal(fileHash('alpha\nbeta\ngamma\n'), '4fdbc4')
+  assert.equal(fileHash(''), 'e3b0c4')
+})
+
 test('splitKeepEnds rejoins to the exact input', () => {
   for (const text of ['', 'a', 'a\n', 'a\nb', 'a\r\nb\r\n', '\n\n']) {
     assert.equal(splitKeepEnds(text).join(''), text)
@@ -141,17 +146,25 @@ test('a whole-file range is replaced', () => {
 })
 
 test('a stale file hash is rejected before any anchor check', () => {
-  const result = applyPatch(request({ expectedFileHash: 'deadbeefdeadbeef', startAnchor: 'nonsense' }))
+  const result = applyPatch(request({ expectedFileHash: 'deadbe', startAnchor: 'nonsense' }))
   assert.equal(result.ok, false)
   assert.equal(result.code, 'FILE_HASH_MISMATCH')
   assert.match(result.message, /read it again/)
 })
 
-test('a truncated file hash is a mismatch, not a prefix match', () => {
+test('a 16-character hash from an older session is an argument error, not a stale file', () => {
+  const result = applyPatch(request({ expectedFileHash: fileHash(SAMPLE).padEnd(16, '0') }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'BAD_ARGUMENT')
+  assert.match(result.message, /6-character lowercase hex/)
+  assert.match(result.message, /use edit or write instead/)
+})
+
+test('a truncated file hash is an argument error, not a prefix match', () => {
   const full = fileHash(SAMPLE)
   const result = applyPatch(request({ expectedFileHash: full.slice(0, 4) }))
   assert.equal(result.ok, false)
-  assert.equal(result.code, 'FILE_HASH_MISMATCH')
+  assert.equal(result.code, 'BAD_ARGUMENT')
 })
 
 test('an anchor that occurs mid-line is not a start anchor', () => {
@@ -315,6 +328,93 @@ test('a wrong end anchor that shares the tail of the line is still rejected', ()
   })
   assert.equal(result.ok, false)
   assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+})
+
+test('an anchor shared by two long lines is rejected with a widening suggestion', () => {
+  const first = 'const value = computeAlpha(input)'
+  const second = 'const value = computeBeta_(input)'
+  const content = `${first}\n${second}\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: 'const value = co',
+    lineEnd: 2,
+    endAnchor: endAnchorOf(second),
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_AMBIGUOUS')
+  assert.match(result.message, /start_anchor/)
+  assert.match(result.message, /lines 1, 2/)
+  assert.match(result.message, /copy more of it/)
+  assert.match(result.message, /Do not reread the file/)
+})
+
+test('a shared end anchor is rejected too', () => {
+  const first = 'const alpha = compute(input) // trailing tail here'
+  const second = 'const beta_ = compute(input) // trailing tail here'
+  const content = `${first}\n${second}\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: second,
+    lineEnd: 2,
+    endAnchor: 'trailing tail here',
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_AMBIGUOUS')
+  assert.match(result.message, /end_anchor/)
+  assert.match(result.message, /do not reread/i)
+})
+
+test('widening the anchor resolves the ambiguity', () => {
+  const first = 'const value = computeAlpha(input)'
+  const second = 'const value = computeBeta_(input)'
+  const content = `${first}\n${second}\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: second,
+    lineEnd: 2,
+    endAnchor: second,
+    replace: 'x',
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.content, `${first}\nx\n`)
+})
+
+test('a repeated whole line stays editable because no anchor could separate it', () => {
+  const line = 'repeat this exact same line of text'
+  const content = `${line}\n${line}\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: 'repeat this exac',
+    lineEnd: 2,
+    endAnchor: 'same line of text',
+    replace: 'changed',
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.content, `${line}\nchanged\n`)
+})
+
+test('repeated short symbols stay editable', () => {
+  const content = 'if (x) {\n  go()\n}\nif (y) {\n  stop()\n}\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 3,
+    startAnchor: '}',
+    lineEnd: 3,
+    endAnchor: '}',
+    replace: '};',
+  })
+  assert.equal(result.ok, true)
 })
 
 test('a short end anchor is rejected with the length hint', () => {

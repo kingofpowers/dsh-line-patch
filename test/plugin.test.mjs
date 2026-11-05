@@ -13,7 +13,10 @@ function makeCtx() {
   const listeners = new Map()
   const emitted = []
   const intents = []
+  const resolveCalls = []
+  let workingDirectory
   const ctx = {
+    get: (name) => (name === 'workingDirectory' ? workingDirectory : undefined),
     tools: { register: (definition) => { tools.set(definition.name, definition) } },
     on: (eventName, handler) => {
       if (!listeners.has(eventName)) listeners.set(eventName, [])
@@ -22,7 +25,10 @@ function makeCtx() {
     emit: (...args) => { emitted.push(args) },
     waterfall: async (_name, _target, _actor, next) => next(),
     fs: {
-      async resolve(p) { return { targetKey: p, displayPath: p } },
+      async resolve(p, options = {}) {
+        resolveCalls.push({ path: p, options })
+        return { targetKey: p, displayPath: p }
+      },
       async stat(target) {
         const stats = await import('node:fs/promises').then(m => m.stat(target.targetKey)).catch(() => undefined)
         if (!stats) return undefined // the provider contract: absent targets return undefined
@@ -50,7 +56,15 @@ function makeCtx() {
       processPath(target) { return target.targetKey },
     },
   }
-  return { ctx, tools, listeners, emitted, intents }
+  return {
+    ctx,
+    tools,
+    listeners,
+    emitted,
+    intents,
+    resolveCalls,
+    setWorkingDirectory: (service) => { workingDirectory = service },
+  }
 }
 
 /**
@@ -103,7 +117,7 @@ async function annotate(host, toolName, file, content, extra = {}) {
 /** The `file_hash: …` value out of an annotated decision, or undefined. */
 function hashOf(decision) {
   const last = decision.content?.at(-1)
-  const match = typeof last?.text === 'string' ? last.text.match(/^file_hash: ([0-9a-f]+)$/) : null
+  const match = typeof last?.text === 'string' ? last.text.match(/(?:^|\n)file_hash: ([0-9a-f]+)$/) : null
   return match?.[1]
 }
 
@@ -139,7 +153,7 @@ test('a downstream listener keeps running and its content is what gets annotated
   host.listeners.get('tools/post-execute').push((exec, result, next) =>
     next().then(downstream => ({ ...downstream, content: [{ type: 'text', text: 'edited downstream' }] })))
   const decision = await annotate(host, 'read', file, '1: alpha')
-  assert.deepEqual(decision.content.map(block => block.text), ['edited downstream', `file_hash: ${fileHash('alpha\n')}`])
+  assert.deepEqual(decision.content.map(block => block.text), [`edited downstream\nfile_hash: ${fileHash('alpha\n')}`])
 })
 
 test('a downstream block wins and is not annotated', async () => {
@@ -158,11 +172,45 @@ test('a downstream value replacement is left alone', async () => {
   assert.equal(decision.content, undefined)
 })
 
-test('a read result gains the current file hash', async () => {
+test('a read result gains the current file hash in its existing block', async () => {
   const { file, ...host } = await fixture('alpha\nbeta\n')
   const decision = await annotate(host, 'read', file, '1: alpha\n2: beta\n')
   assert.equal(hashOf(decision), fileHash('alpha\nbeta\n'))
-  assert.equal(decision.content.length, 2, 'the annotation is appended, not substituted')
+  assert.equal(decision.content.length, 1, 'the line joins the existing block; plugins that need one block still work')
+  assert.equal(decision.content[0].text, `1: alpha\n2: beta\nfile_hash: ${fileHash('alpha\nbeta\n')}`)
+})
+
+test('a relative path resolves against the session working directory', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  host.setWorkingDirectory({ ensure: async () => '/session/dir' })
+  await annotate(host, 'read', file, '1: alpha')
+  const call = host.resolveCalls.at(-1)
+  assert.equal(call.options.cwd, '/session/dir', 'the hash must describe the file the tool resolved')
+  assert.equal(call.options.signal, undefined)
+})
+
+test('a file that moved between the tool and the hook is not annotated', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version: 'the-version-the-tool-saw' })
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.equal(decision.content, undefined, 'a hash for unseen bytes must not be handed out')
+})
+
+test('a patch emits an observation for the file it wrote', async () => {
+  const content = 'alpha\nbeta\n'
+  const { file, ...host } = await fixture(content)
+  const hash = hashOf(await annotate(host, 'read', file, content))
+  await patch(host.tools, {
+    file_path: file,
+    file_hash: hash,
+    line_start: 2,
+    start_anchor: 'beta',
+    line_end: 2,
+    end_anchor: 'beta',
+    replace: 'BETA',
+  })
+  const observed = host.emitted.filter(([eventName]) => eventName === 'fs/observed')
+  assert.ok(observed.length >= 1, 'the policy gate must see the write')
 })
 
 test('write and edit results gain the hash of the file as it now is', async () => {
