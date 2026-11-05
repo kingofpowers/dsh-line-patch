@@ -55,12 +55,17 @@ function makeCtx() {
 
 /** Deliver one host waterfall event to its listeners, threading the continuation. */
 async function fire(host, eventName, ...args) {
-  const next = (decision) => decision
-  for (const handler of host.listeners.get(eventName) ?? []) {
-    const returned = await handler(...args, next)
-    if (returned !== undefined) return returned
+  // Cordis waterfall: the outermost listener's return value is the result, and a
+  // listener that never calls `next` vetoes every listener inside it.
+  let nextCalls = 0
+  const next = (decision) => {
+    nextCalls += 1
+    return decision
   }
-  return next({ kind: 'accept' })
+  let returned
+  for (const handler of host.listeners.get(eventName) ?? []) returned = await handler(...args, next)
+  host.lastNextCalls = nextCalls
+  return returned ?? next({ kind: 'accept' })
 }
 
 /** Create a temp file and return its path plus a stub host bound to it. */
@@ -110,6 +115,14 @@ test('the patch schema marks the anchor fields required and has no total_lines',
     assert.equal(spec[key]?.required, true, `${key} must be required`)
   }
   assert.equal(spec.total_lines, undefined)
+})
+
+test('the hook always continues the waterfall instead of vetoing it', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  await annotate(host, 'read', file, '1: alpha')
+  assert.equal(host.lastNextCalls, 1, 'the annotation listener must call next()')
+  await annotate(host, 'grep', file, 'x')
+  assert.equal(host.lastNextCalls, 1, 'an unrelated tool must still continue the chain')
 })
 
 test('a read result gains the current file hash', async () => {
