@@ -143,6 +143,14 @@ test('results without text, failed results and unrelated tools are left alone', 
   assert.equal(other.content, undefined)
 })
 
+test('an already annotated result is not annotated twice', async () => {
+  const { file, ...host } = await fixture('a\n')
+  const already = { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'file_hash: abc123' }], isError: false }
+  const decision = await fire(host, 'tools/post-execute',
+    { name: 'read', arguments: { file_path: file }, callId: 'c' }, already)
+  assert.equal(decision.content, undefined)
+})
+
 test('a vanished file simply gets no hash instead of failing the tool call', async () => {
   const { ...host } = await fixture('a\n')
   const decision = await annotate(host, 'read', join(tmpdir(), 'definitely-absent-file.txt'), 'x')
