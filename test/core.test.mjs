@@ -202,6 +202,35 @@ test('out-of-range requests are rejected', () => {
   assert.equal(inverted.code, 'RANGE_INVALID')
 })
 
+test('a line number below 1 is rejected too', () => {
+  const result = applyPatch(request({ lineStart: 0, lineEnd: 0 }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'RANGE_INVALID')
+  assert.match(result.message, /line_start 0 is out of range/)
+})
+
+test('an empty file cannot be patched', () => {
+  const result = applyPatch({
+    content: '',
+    expectedFileHash: fileHash(''),
+    lineStart: 1,
+    startAnchor: '',
+    lineEnd: 1,
+    endAnchor: '',
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'RANGE_INVALID')
+  assert.match(result.message, /the file is empty/)
+})
+
+test('a single-line patch still rejects an anchor that matches nothing', () => {
+  const result = applyPatch(request({ startAnchor: 'be', endAnchor: 'zzzz' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.match(result.message, /line 2 does not end with "zzzz"/)
+})
+
 test('an empty replacement deletes the range instead of leaving a blank line', () => {
   const result = applyPatch(request({ lineStart: 2, lineEnd: 3, replace: '' }))
   assert.equal(result.ok, true)

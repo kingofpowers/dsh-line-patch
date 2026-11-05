@@ -95,9 +95,17 @@ test('read_hash numbers every line, hashes the file, and adds no per-line hash',
   const out = await call(tools, 'read_hash', { file_path: file })
   assert.equal(out.file_hash, fileHash('alpha\nbeta\ngamma\n'))
   assert.equal(out.total_lines, 3)
-  assert.equal(out.anchor_chars, 16)
   const rows = out.content.trimEnd().split('\n')
   assert.deepEqual(rows, [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`, `3${LINE_SEPARATOR}gamma`])
+})
+
+test('an empty file reads as a hash and no lines', async () => {
+  const { file, tools } = await fixture('')
+  const out = await call(tools, 'read_hash', { file_path: file })
+  assert.equal(out.total_lines, 0)
+  assert.equal(out.content, '')
+  const rendered = tools.get('read_hash').output.render({}, out)[0].text
+  assert.equal(rendered, `file_hash: ${fileHash('')}\nfile is empty (0 lines)`)
 })
 
 test('read_hash honours offset and limit with absolute numbering', async () => {

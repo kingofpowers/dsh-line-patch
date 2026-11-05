@@ -116,7 +116,7 @@ stat 预筛（微秒级，不读文件）
 |---|---|
 | `read_hash` 输出 `1/f3c2: 内容` | `1│内容`（无逐行 hash） |
 | `hash_start` / `hash_end`（4 位 md5） | `start_anchor` / `end_anchor`（16 字符内容切片） |
-| `line_hash_chars` | `anchor_chars` |
+| 输出里的 `line_hash_chars` 字段 | 已移除（锚点长度固定 16，写在工具描述里） |
 
 没有兼容层：旧调用会因缺少 `start_anchor`/`end_anchor` 被 schema 拒绝。重新 `read_hash` 一次即可拿到新格式。
 
@@ -124,7 +124,7 @@ stat 预筛（微秒级，不读文件）
 
 0.2.x 在真实宿主上验证过替换、行位移、过期 `file_hash`、`replace: ""` 与 `replaceIfVersion` intent；0.3.0 的边界锚点、空白宽容、短行/空行、EOF/BOF、单行双锚点、错误分流由离线测试覆盖。
 
-离线测试：`npm test` — 45 个用例（核心逻辑 26 + 工具胶水 14 + 锚点核实 5），全部通过。
+离线测试：`npm test` — 49 个用例（核心逻辑 29 + 工具胶水 15 + 锚点核实 5），全部通过。
 
 ## 尚未实现
 
@@ -135,6 +135,7 @@ stat 预筛（微秒级，不读文件）
 
 - 单文件 5 MB 上限。
 - `read_hash` 单次最多 2000 行。
+- 空文件（0 行）没有可锚定的行，`patch_hash` 直接拒绝并提示改用 `write`。
 - 极短且高度重复的行（如孤立的 `}`）作为锚点时区分力弱；此时依赖行号 + `total_lines` + 整文件哈希，属于已知残余风险。
 - `fs/write-intent` 不可用时退化为自行构造的 `replaceIfVersion`；再不可用则退化为无条件写（此时只剩 sha256 与内容锚点保护）。
 - 若 `@deepseek-ai/dsh-tools` 无法解析，`defineTool` 退化为恒等函数：工具仍可用，但参数校验交给插件自己。
