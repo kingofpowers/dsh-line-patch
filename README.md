@@ -131,7 +131,7 @@ stat 预筛（微秒级，不读文件）
 
 0.2.x 在真实宿主上验证过替换、行位移、过期 `file_hash`、`replace: ""` 与 `replaceIfVersion` intent；0.3.0 的边界锚点、空白宽容、缩进严格性、短行/空行、EOF/BOF、单行双锚点、错误分流由离线测试覆盖。
 
-离线测试：`npm test` — 73 个用例（核心逻辑 50 + 工具胶水 18 + 锚点核实 5），全部通过。
+离线测试：`npm test` — 74 个用例（核心逻辑 51 + 工具胶水 18 + 锚点核实 5），全部通过。
 
 0.3.0 **尚未在真实宿主上做端到端验证**（只做了离线测试，以及按真实宿主 `@deepseek-ai/dsh-tools` 的 schema 编译结果核对参数表）；首次装进 desktop profile 时应当先跑一遍 `read_hash` → `patch_hash`。
 

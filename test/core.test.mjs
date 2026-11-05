@@ -421,6 +421,7 @@ test('a start anchor that is only whitespace asks for a slice with content', () 
   assert.equal(result.ok, false)
   assert.equal(result.code, 'ANCHOR_TOO_SHORT')
   assert.match(result.message, /only whitespace/)
+  assert.match(result.message, /Do not reread the file/)
 })
 
 test('an end anchor that is only whitespace asks for a slice with content', () => {
@@ -437,21 +438,57 @@ test('an end anchor that is only whitespace asks for a slice with content', () =
   assert.equal(result.ok, false)
   assert.equal(result.code, 'ANCHOR_TOO_SHORT')
   assert.match(result.message, /only whitespace/)
+  assert.match(result.message, /Do not reread the file/)
 })
 
-test('a mismatch caused only by indentation shows both strings', () => {
-  const content = 'if (err) {\n    if (err) {\n        log(err)\n    }\n}\n'
+test('a whitespace-only anchor on a blank line points at the empty anchor', () => {
+  const content = 'a\n    \nb\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: '   ',
+    lineEnd: 2,
+    endAnchor: '   ',
+    replace: 'X',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_TOO_SHORT')
+  assert.match(result.message, /line 2 is blank/)
+  assert.match(result.message, /pass ""/)
+
+  const withEmpty = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: '',
+    lineEnd: 2,
+    endAnchor: '',
+    replace: 'X',
+  })
+  assert.equal(withEmpty.ok, true)
+  assert.equal(withEmpty.content, 'a\nX\nb\n')
+})
+
+test('an indentation mismatch echoes the line exactly as shown', () => {
+  const content = '    if (err) {\n        log()\n}\n'
   const result = applyPatch({
     content,
     expectedFileHash: fileHash(content),
     lineStart: 1,
-    startAnchor: '    if (err) {',
+    startAnchor: '        if (err) {',
     lineEnd: 1,
-    endAnchor: '    if (err) {',
-    replace: 'if (fatal) {',
+    endAnchor: endAnchorOf('    if (err) {'),
+    replace: '    if (fatal) {',
   })
-  assert.match(result.message, /"    if \(err\) \{"/)
-  assert.match(result.message, /which starts with "if \(err\) \{"/)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  // The echoed anchor must keep the indentation the model is told to copy.
+  assert.ok(
+    result.message.includes(JSON.stringify('    if (err) {')),
+    `message must echo the indented anchor: ${result.message}`,
+  )
+  assert.match(result.message, /including the indentation/)
 })
 
 test('inner whitespace runs on the line side are still matched', () => {
