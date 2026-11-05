@@ -183,7 +183,7 @@ test('a read result gains the current file hash in its existing block', async ()
 test('a relative path resolves against the session working directory', async () => {
   const { file, ...host } = await fixture('alpha\n')
   host.setWorkingDirectory({ ensure: async () => '/session/dir' })
-  await annotate(host, 'read', file, '1: alpha')
+  await annotate(host, 'read', file, '1: alpha', { agent: { id: 'agent-1' } })
   const call = host.resolveCalls.at(-1)
   assert.equal(call.options.cwd, '/session/dir', 'the hash must describe the file the tool resolved')
   assert.equal(call.options.signal, undefined)
