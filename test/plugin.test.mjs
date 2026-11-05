@@ -5,7 +5,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, name } from '../lib/index.js'
-import { fileHash, lineHash, splitKeepEnds } from '../lib/core.js'
+import { LINE_SEPARATOR, endAnchorOf, fileHash, splitKeepEnds, startAnchorOf } from '../lib/core.js'
 
 /** Build a stub plugin context exposing the host surface the plugin touches. */
 function makeCtx() {
@@ -64,20 +64,40 @@ async function call(tools, toolName, args) {
   return tools.get(toolName).execute(args, { signal: undefined })
 }
 
+/** Pull the text of one 1-based line out of a read_hash result, as a model would. */
+function rowText(readOutput, lineNumber) {
+  const prefix = `${lineNumber}${LINE_SEPARATOR}`
+  const row = readOutput.content.split('\n').find(line => line.startsWith(prefix))
+  assert.ok(row, `line ${lineNumber} missing from the read result`)
+  return row.slice(prefix.length)
+}
+
+/** Build patch_hash arguments whose anchors repeat what the read result showed. */
+function patchArgs(file, readOutput, lineStart, lineEnd = lineStart, replace = 'X') {
+  return {
+    file_path: file,
+    file_hash: readOutput.file_hash,
+    line_start: lineStart,
+    start_anchor: startAnchorOf(rowText(readOutput, lineStart)),
+    line_end: lineEnd,
+    end_anchor: endAnchorOf(rowText(readOutput, lineEnd)),
+    replace,
+  }
+}
+
 test('the plugin exports the expected shape', () => {
   assert.equal(name, 'line-patch')
   assert.deepEqual(inject, ['tools', 'fs'])
 })
 
-test('read_hash annotates every line and reports the file hash', async () => {
+test('read_hash numbers every line, hashes the file, and adds no per-line hash', async () => {
   const { file, tools } = await fixture('alpha\nbeta\ngamma\n')
   const out = await call(tools, 'read_hash', { file_path: file })
   assert.equal(out.file_hash, fileHash('alpha\nbeta\ngamma\n'))
   assert.equal(out.total_lines, 3)
+  assert.equal(out.anchor_chars, 16)
   const rows = out.content.trimEnd().split('\n')
-  assert.equal(rows.length, 3)
-  assert.match(rows[0], /^1\/[0-9a-f]{4}: alpha$/)
-  assert.match(rows[2], /^3\/[0-9a-f]{4}: gamma$/)
+  assert.deepEqual(rows, [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`, `3${LINE_SEPARATOR}gamma`])
 })
 
 test('read_hash honours offset and limit with absolute numbering', async () => {
@@ -85,24 +105,15 @@ test('read_hash honours offset and limit with absolute numbering', async () => {
   const out = await call(tools, 'read_hash', { file_path: file, offset: 2, limit: 2 })
   const rows = out.content.trimEnd().split('\n')
   assert.equal(rows.length, 2)
-  assert.match(rows[0], /^2\/[0-9a-f]{4}: b$/)
+  assert.equal(rows[0], `2${LINE_SEPARATOR}b`)
   assert.equal(out.truncated, true)
 })
 
-test('patch_hash rewrites the range and reports the new file hash', async () => {
+test('patch_hash rewrites a range whose anchors came from the read result', async () => {
   const content = 'alpha\nbeta\ngamma\n'
   const { file, tools } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
-  const lines = splitKeepEnds(content).map(l => l.replace(/\n$/, ''))
-  const out = await call(tools, 'patch_hash', {
-    file_path: file,
-    file_hash: read.file_hash,
-    line_start: 2,
-    hash_start: lineHash(lines[1]),
-    line_end: 2,
-    hash_end: lineHash(lines[1]),
-    replace: 'BETA',
-  })
+  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'BETA'))
   assert.deepEqual(out.replaced, [2, 2])
   assert.equal(out.line_shift, 0)
   const after = await readFile(file, 'utf8')
@@ -110,58 +121,57 @@ test('patch_hash rewrites the range and reports the new file hash', async () => 
   assert.equal(out.new_file_hash, fileHash(after))
 })
 
+test('a multi-line patch uses both boundary lines', async () => {
+  const content = 'alpha\nbeta\ngamma\ndelta\n'
+  const { file, tools } = await fixture(content)
+  const read = await call(tools, 'read_hash', { file_path: file })
+  const args = patchArgs(file, read, 2, 3, 'one\ntwo\nthree')
+  const out = await call(tools, 'patch_hash', args)
+  assert.equal(out.line_shift, 1)
+  assert.equal(await readFile(file, 'utf8'), 'alpha\none\ntwo\nthree\ndelta\n')
+})
+
 test('patch_hash refuses a stale file hash and leaves the file untouched', async () => {
   const content = 'alpha\nbeta\n'
   const { file, tools } = await fixture(content)
-  const lines = splitKeepEnds(content).map(l => l.replace(/\n$/, ''))
+  const read = await call(tools, 'read_hash', { file_path: file })
   await assert.rejects(
-    () => call(tools, 'patch_hash', {
-      file_path: file,
-      file_hash: 'deadbeefdeadbeef',
-      line_start: 2,
-      hash_start: lineHash(lines[1]),
-      line_end: 2,
-      hash_end: lineHash(lines[1]),
-      replace: 'X',
-    }),
+    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), file_hash: 'deadbeefdeadbeef' }),
     /file_hash mismatch/,
   )
   assert.equal(await readFile(file, 'utf8'), content)
 })
 
-test('patch_hash refuses a stale boundary hash and leaves the file untouched', async () => {
+test('a wrong line number is reported as an anchor error that says not to reread', async () => {
   const content = 'alpha\nbeta\n'
   const { file, tools } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
   await assert.rejects(
-    () => call(tools, 'patch_hash', {
-      file_path: file,
-      file_hash: read.file_hash,
-      line_start: 1,
-      hash_start: 'zzzz',
-      line_end: 2,
-      hash_end: 'zzzz',
-      replace: 'X',
-    }),
-    /line 1 hash mismatch/,
+    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), start_anchor: 'gamma' }),
+    error => {
+      assert.match(error.message, /does not start with "gamma"/)
+      assert.match(error.message, /Do not reread the file/)
+      return true
+    },
   )
   assert.equal(await readFile(file, 'utf8'), content)
+})
+
+test('total_lines rejects a wrong line number before any anchor check', async () => {
+  const content = 'alpha\nbeta\n'
+  const { file, tools } = await fixture(content)
+  const read = await call(tools, 'read_hash', { file_path: file })
+  await assert.rejects(
+    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), total_lines: 7 }),
+    /total_lines mismatch/,
+  )
 })
 
 test('an empty replace deletes the range', async () => {
   const content = 'alpha\nbeta\ngamma\n'
   const { file, tools } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
-  const lines = splitKeepEnds(content).map(l => l.replace(/\n$/, ''))
-  const out = await call(tools, 'patch_hash', {
-    file_path: file,
-    file_hash: read.file_hash,
-    line_start: 2,
-    hash_start: lineHash(lines[1]),
-    line_end: 2,
-    hash_end: lineHash(lines[1]),
-    replace: '',
-  })
+  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, ''))
   assert.equal(out.line_shift, -1)
   assert.equal(await readFile(file, 'utf8'), 'alpha\ngamma\n')
 })
@@ -170,16 +180,7 @@ test('writes reach the provider with a replaceIfVersion intent', async () => {
   const content = 'alpha\nbeta\n'
   const { file, tools, intents } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
-  const lines = splitKeepEnds(content).map(l => l.replace(/\n$/, ''))
-  await call(tools, 'patch_hash', {
-    file_path: file,
-    file_hash: read.file_hash,
-    line_start: 2,
-    hash_start: lineHash(lines[1]),
-    line_end: 2,
-    hash_end: lineHash(lines[1]),
-    replace: 'Y',
-  })
+  await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'Y'))
   assert.equal(intents.length, 1)
   assert.equal(intents[0].kind, 'replaceIfVersion')
 })
@@ -198,4 +199,26 @@ test('a missing file fails with a clear message', async () => {
     () => call(tools, 'read_hash', { file_path: join(tmpdir(), 'definitely-absent-file.txt') }),
     /file not found/,
   )
+})
+
+test('consecutive patches only need the hash the previous patch returned', async () => {
+  const content = 'one\ntwo\nthree\n'
+  const { file, tools } = await fixture(content)
+  const read = await call(tools, 'read_hash', { file_path: file })
+  const first = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'TWO'))
+  const second = await call(tools, 'patch_hash', {
+    file_path: file,
+    file_hash: first.new_file_hash,
+    line_start: 2,
+    start_anchor: 'TWO',
+    line_end: 2,
+    end_anchor: 'TWO',
+    replace: 'TWO!',
+  })
+  assert.equal(second.new_file_hash, fileHash('one\nTWO!\nthree\n'))
+  assert.equal(await readFile(file, 'utf8'), 'one\nTWO!\nthree\n')
+})
+
+test('splitKeepEnds is the line model the plugin exposes', () => {
+  assert.equal(splitKeepEnds('a\r\nb').length, 2)
 })

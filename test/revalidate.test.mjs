@@ -5,7 +5,6 @@ import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
-import { lineHash, splitKeepEnds } from '../lib/core.js'
 
 /** Stub host that records listeners so tests can fire them deterministically. */
 function makeHost() {
@@ -124,14 +123,13 @@ test('an anchor older than the turn window is dropped without any I/O', async ()
 test('patch_hash refreshes the anchor so its own write is not reported as external', async () => {
   const { file, host } = await fixture('a\nb\n')
   const read = await readAnchor(host, file)
-  const lines = splitKeepEnds('a\nb\n').map(l => l.replace(/\n$/, ''))
   await host.tools.get('patch_hash').execute({
     file_path: file,
     file_hash: read.file_hash,
     line_start: 2,
-    hash_start: lineHash(lines[1]),
+    start_anchor: 'b',
     line_end: 2,
-    hash_end: lineHash(lines[1]),
+    end_anchor: 'b',
     replace: 'B',
   }, { callId: 'call-2', signal: undefined })
   const appendsBefore = host.appended.length
