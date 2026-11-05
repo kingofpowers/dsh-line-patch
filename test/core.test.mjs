@@ -456,6 +456,7 @@ test('a whitespace-only anchor on a blank line points at the empty anchor', () =
   assert.equal(result.code, 'ANCHOR_TOO_SHORT')
   assert.match(result.message, /line 2 is blank/)
   assert.match(result.message, /pass ""/)
+  assert.match(result.message, /Do not reread the file/)
 
   const withEmpty = applyPatch({
     content,
