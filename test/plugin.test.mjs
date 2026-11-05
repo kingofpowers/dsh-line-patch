@@ -53,19 +53,28 @@ function makeCtx() {
   return { ctx, tools, listeners, emitted, intents }
 }
 
-/** Deliver one host waterfall event to its listeners, threading the continuation. */
+/**
+ * Deliver one host waterfall event exactly as cordis does.
+ *
+ * `next()` takes NO arguments and returns the downstream decision; the
+ * outermost listener's return value becomes the result the host applies. A
+ * listener that never calls `next()` vetoes every listener beneath it.
+ */
 async function fire(host, eventName, ...args) {
-  // Cordis waterfall: the outermost listener's return value is the result, and a
-  // listener that never calls `next` vetoes every listener inside it.
+  const handlers = [...(host.listeners.get(eventName) ?? [])]
+  const inner = () => ({ kind: 'accept' })
   let nextCalls = 0
-  const next = (decision) => {
-    nextCalls += 1
-    return decision
+  const run = async (index) => {
+    if (index >= handlers.length) return inner()
+    const next = () => {
+      nextCalls += 1
+      return run(index + 1)
+    }
+    return handlers[index](...args, next)
   }
-  let returned
-  for (const handler of host.listeners.get(eventName) ?? []) returned = await handler(...args, next)
+  const result = await run(0)
   host.lastNextCalls = nextCalls
-  return returned ?? next({ kind: 'accept' })
+  return result
 }
 
 /** Create a temp file and return its path plus a stub host bound to it. */
@@ -123,6 +132,30 @@ test('the hook always continues the waterfall instead of vetoing it', async () =
   assert.equal(host.lastNextCalls, 1, 'the annotation listener must call next()')
   await annotate(host, 'grep', file, 'x')
   assert.equal(host.lastNextCalls, 1, 'an unrelated tool must still continue the chain')
+})
+
+test('a downstream listener keeps running and its content is what gets annotated', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  host.listeners.get('tools/post-execute').push((exec, result, next) =>
+    next().then(downstream => ({ ...downstream, content: [{ type: 'text', text: 'edited downstream' }] })))
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.deepEqual(decision.content.map(block => block.text), ['edited downstream', `file_hash: ${fileHash('alpha\n')}`])
+})
+
+test('a downstream block wins and is not annotated', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  host.listeners.get('tools/post-execute').push(() => ({ kind: 'block', feedback: [{ type: 'text', text: 'no' }] }))
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.equal(decision.kind, 'block')
+  assert.equal(decision.content, undefined)
+})
+
+test('a downstream value replacement is left alone', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  host.listeners.get('tools/post-execute').push(() => ({ kind: 'accept', value: { replaced: true } }))
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.deepEqual(decision.value, { replaced: true })
+  assert.equal(decision.content, undefined)
 })
 
 test('a read result gains the current file hash', async () => {

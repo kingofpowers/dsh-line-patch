@@ -65,7 +65,8 @@ async function readAnchor(host, file, callId = 'call-1') {
   const decision = await host.fire('tools/post-execute',
     { name: 'read', arguments: { file_path: file }, callId },
     { content: [{ type: 'text', text: '1: a' }], isError: false },
-    (value) => value)
+    // Cordis waterfall: `next()` takes no arguments and returns the downstream decision.
+    () => ({ kind: 'accept' }))
   // The host reports our own result sequence through session/event.
   await host.fire('session/event', host.session, {
     type: 'tool/result',
