@@ -1,20 +1,24 @@
-/** Glue tests: the plugin's two tools against a stub host (no Harness needed). */
+/** Glue tests: the hash annotation and the `patch` tool against a stub host. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, name } from '../lib/index.js'
-import { LINE_SEPARATOR, fileHash } from '../lib/core.js'
+import { ANCHOR_CHARS, endAnchorOf, fileHash, startAnchorOf } from '../lib/core.js'
 
 /** Build a stub plugin context exposing the host surface the plugin touches. */
 function makeCtx() {
   const tools = new Map()
+  const listeners = new Map()
   const emitted = []
   const intents = []
   const ctx = {
     tools: { register: (definition) => { tools.set(definition.name, definition) } },
-    on: () => {},
+    on: (eventName, handler) => {
+      if (!listeners.has(eventName)) listeners.set(eventName, [])
+      listeners.get(eventName).push(handler)
+    },
     emit: (...args) => { emitted.push(args) },
     waterfall: async (_name, _target, _actor, next) => next(),
     fs: {
@@ -46,7 +50,17 @@ function makeCtx() {
       processPath(target) { return target.targetKey },
     },
   }
-  return { ctx, tools, emitted, intents }
+  return { ctx, tools, listeners, emitted, intents }
+}
+
+/** Deliver one host waterfall event to its listeners, threading the continuation. */
+async function fire(host, eventName, ...args) {
+  const next = (decision) => decision
+  for (const handler of host.listeners.get(eventName) ?? []) {
+    const returned = await handler(...args, next)
+    if (returned !== undefined) return returned
+  }
+  return next({ kind: 'accept' })
 }
 
 /** Create a temp file and return its path plus a stub host bound to it. */
@@ -59,32 +73,24 @@ async function fixture(content) {
   return { file, ...host }
 }
 
-/** Drive a registered tool with canonical arguments. */
-async function call(tools, toolName, args) {
-  return tools.get(toolName).execute(args, { signal: undefined })
+/** Drive the registered patch tool with canonical arguments. */
+async function patch(tools, args) {
+  return tools.get('patch').execute(args, { signal: undefined })
 }
 
-/** Pull the text of one 1-based line out of a read_hash result, as a model would. */
-function rowText(readOutput, lineNumber) {
-  const prefix = `${lineNumber}${LINE_SEPARATOR}`
-  const row = readOutput.content.split('\n').find(line => line.startsWith(prefix))
-  assert.ok(row, `line ${lineNumber} missing from the read result`)
-  return row.slice(prefix.length)
+/** Ask the post-execute hook to annotate a result, as the host would. */
+async function annotate(host, toolName, file, content, extra = {}) {
+  const exec = { name: toolName, arguments: { file_path: file }, callId: 'call-1', ...extra }
+  const result = { content: [{ type: 'text', text: content }], isError: false }
+  const decision = await fire(host, 'tools/post-execute', exec, result)
+  return decision
 }
 
-/** Build patch_hash arguments from anchors copied literally out of the read result. */
-function patchArgs(file, readOutput, lineStart, lineEnd = lineStart, replace = 'X') {
-  const startRow = rowText(readOutput, lineStart)
-  const endRow = rowText(readOutput, lineEnd)
-  return {
-    file_path: file,
-    file_hash: readOutput.file_hash,
-    line_start: lineStart,
-    start_anchor: startRow.slice(0, 16),
-    line_end: lineEnd,
-    end_anchor: endRow.trimEnd().slice(-16),
-    replace,
-  }
+/** The `file_hash: …` value out of an annotated decision, or undefined. */
+function hashOf(decision) {
+  const last = decision.content?.at(-1)
+  const match = typeof last?.text === 'string' ? last.text.match(/^file_hash: ([0-9a-f]+)$/) : null
+  return match?.[1]
 }
 
 test('the plugin exports the expected shape', () => {
@@ -92,178 +98,164 @@ test('the plugin exports the expected shape', () => {
   assert.deepEqual(inject, ['tools', 'fs'])
 })
 
-test('the schema marks the anchor fields required and the extras optional', () => {
-  const host = makeCtx()
-  apply(host.ctx)
-  const spec = host.tools.get('patch_hash').parameters
+test('only the patch tool is registered — there is no read_hash', async () => {
+  const { tools } = await fixture('a\n')
+  assert.deepEqual([...tools.keys()], ['patch'])
+})
+
+test('the patch schema marks the anchor fields required and has no total_lines', async () => {
+  const { tools } = await fixture('a\n')
+  const spec = tools.get('patch').parameters
   for (const key of ['file_path', 'file_hash', 'line_start', 'start_anchor', 'line_end', 'end_anchor', 'replace']) {
     assert.equal(spec[key]?.required, true, `${key} must be required`)
   }
-  assert.equal(spec.total_lines?.required, undefined)
-  assert.equal(spec.total_lines?.type, 'number')
+  assert.equal(spec.total_lines, undefined)
 })
 
-test('read_hash numbers every line, hashes the file, and adds no per-line hash', async () => {
-  const { file, tools } = await fixture('alpha\nbeta\ngamma\n')
-  const out = await call(tools, 'read_hash', { file_path: file })
-  assert.equal(out.file_hash, fileHash('alpha\nbeta\ngamma\n'))
-  assert.equal(out.total_lines, 3)
-  const rows = out.content.trimEnd().split('\n')
-  assert.deepEqual(rows, [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`, `3${LINE_SEPARATOR}gamma`])
+test('a read result gains the current file hash', async () => {
+  const { file, ...host } = await fixture('alpha\nbeta\n')
+  const decision = await annotate(host, 'read', file, '1: alpha\n2: beta\n')
+  assert.equal(hashOf(decision), fileHash('alpha\nbeta\n'))
+  assert.equal(decision.content.length, 2, 'the annotation is appended, not substituted')
 })
 
-test('read_hash keeps CRLF out of the rendered rows', async () => {
-  const { file, tools } = await fixture('alpha\r\nbeta\r\n')
-  const out = await call(tools, 'read_hash', { file_path: file })
-  assert.deepEqual(out.content.trimEnd().split('\n'), [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`])
+test('write and edit results gain the hash of the file as it now is', async () => {
+  const { file, ...host } = await fixture('changed\n')
+  for (const toolName of ['write', 'edit']) {
+    const decision = await annotate(host, toolName, file, 'ok')
+    assert.equal(hashOf(decision), fileHash('changed\n'), `${toolName} must carry the new hash`)
+  }
 })
 
-test('an empty file reads as a hash and no lines', async () => {
-  const { file, tools } = await fixture('')
-  const out = await call(tools, 'read_hash', { file_path: file })
-  assert.equal(out.total_lines, 0)
-  assert.equal(out.content, '')
-  const rendered = tools.get('read_hash').output.render({}, out)[0].text
-  assert.equal(rendered, `file_hash: ${fileHash('')}\nfile is empty (0 lines)`)
+test('results without text, failed results and unrelated tools are left alone', async () => {
+  const { file, ...host } = await fixture('a\n')
+  const binary = await fire(host, 'tools/post-execute',
+    { name: 'read', arguments: { file_path: file }, callId: 'c' },
+    { content: [{ type: 'image', data: 'x' }], isError: false })
+  assert.equal(binary.content, undefined)
+  const failed = await fire(host, 'tools/post-execute',
+    { name: 'write', arguments: { file_path: file }, callId: 'c' },
+    { content: [{ type: 'text', text: 'boom' }], isError: true })
+  assert.equal(failed.content, undefined)
+  const other = await fire(host, 'tools/post-execute',
+    { name: 'grep', arguments: { file_path: file }, callId: 'c' },
+    { content: [{ type: 'text', text: 'x' }], isError: false })
+  assert.equal(other.content, undefined)
 })
 
-test('read_hash honours offset and limit with absolute numbering', async () => {
-  const { file, tools } = await fixture('a\nb\nc\nd\n')
-  const out = await call(tools, 'read_hash', { file_path: file, offset: 2, limit: 2 })
-  const rows = out.content.trimEnd().split('\n')
-  assert.equal(rows.length, 2)
-  assert.equal(rows[0], `2${LINE_SEPARATOR}b`)
-  assert.equal(out.truncated, true)
+test('a vanished file simply gets no hash instead of failing the tool call', async () => {
+  const { ...host } = await fixture('a\n')
+  const decision = await annotate(host, 'read', join(tmpdir(), 'definitely-absent-file.txt'), 'x')
+  assert.equal(decision.content, undefined)
 })
 
-test('an offset past the end of the file reports no rows', async () => {
-  const { file, tools } = await fixture('a\nb\n')
-  const out = await call(tools, 'read_hash', { file_path: file, offset: 9 })
-  assert.equal(out.line_count, 0)
-  assert.equal(out.content, '')
-  assert.equal(out.total_lines, 2)
-  const rendered = tools.get('read_hash').output.render({}, out)[0].text
-  assert.equal(rendered, `file_hash: ${fileHash('a\nb\n')}\nno lines at offset 9 (file has 2 lines)`)
-})
-
-test('patch_hash rewrites a range whose anchors came from the read result', async () => {
+test('patch rewrites a range using the hash the read result showed', async () => {
   const content = 'alpha\nbeta\ngamma\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'BETA'))
+  const { file, ...host } = await fixture(content)
+  const hash = hashOf(await annotate(host, 'read', file, content))
+  const out = await patch(host.tools, {
+    file_path: file,
+    file_hash: hash,
+    line_start: 2,
+    start_anchor: startAnchorOf('beta'),
+    line_end: 2,
+    end_anchor: endAnchorOf('beta'),
+    replace: 'BETA',
+  })
   assert.deepEqual(out.replaced, [2, 2])
   assert.equal(out.line_shift, 0)
-  const after = await readFile(file, 'utf8')
-  assert.equal(after, 'alpha\nBETA\ngamma\n')
-  assert.equal(out.new_file_hash, fileHash(after))
+  assert.equal(await readFile(file, 'utf8'), 'alpha\nBETA\ngamma\n')
+  assert.equal(out.new_file_hash, fileHash('alpha\nBETA\ngamma\n'))
 })
 
-test('a rendered row can be pasted back literally, indentation and all', async () => {
-  const line = '    const total = compute(alpha, beta)   '
+test('anchors are copied literally from what read displayed', async () => {
+  const line = '    const total = compute(alpha, beta)'
   const content = `${line}\nsecond\n`
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  const row = rowText(read, 1)
-  assert.equal(row, line, 'the read result must reproduce the line verbatim')
-  const out = await call(tools, 'patch_hash', {
+  const { file, ...host } = await fixture(content)
+  const hash = hashOf(await annotate(host, 'read', file, content))
+  const out = await patch(host.tools, {
     file_path: file,
-    file_hash: read.file_hash,
+    file_hash: hash,
     line_start: 1,
-    start_anchor: row.slice(0, 16),
+    start_anchor: line.slice(0, ANCHOR_CHARS),
     line_end: 1,
-    end_anchor: row.trimEnd().slice(-16),
+    end_anchor: line.trimEnd().slice(-ANCHOR_CHARS),
     replace: 'const total = 0',
   })
   assert.equal(out.line_shift, 0)
   assert.equal(await readFile(file, 'utf8'), 'const total = 0\nsecond\n')
 })
 
-test('a multi-line patch uses both boundary lines', async () => {
-  const content = 'alpha\nbeta\ngamma\ndelta\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 3, 'one\ntwo\nthree'))
-  assert.equal(out.line_shift, 1)
-  assert.equal(await readFile(file, 'utf8'), 'alpha\none\ntwo\nthree\ndelta\n')
-})
-
-test('patch_hash refuses a stale file hash and leaves the file untouched', async () => {
+test('patch refuses a stale hash and leaves the file untouched', async () => {
   const content = 'alpha\nbeta\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
+  const { file, ...host } = await fixture(content)
   await assert.rejects(
-    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), file_hash: 'deadbeefdeadbeef' }),
+    () => patch(host.tools, {
+      file_path: file,
+      file_hash: '000000',
+      line_start: 2,
+      start_anchor: 'beta',
+      line_end: 2,
+      end_anchor: 'beta',
+      replace: 'X',
+    }),
     /file_hash mismatch.*read it again/,
   )
   assert.equal(await readFile(file, 'utf8'), content)
 })
 
-test('a wrong line number is reported as an anchor error that says not to reread', async () => {
+test('a wrong line number is an anchor error that says not to reread', async () => {
   const content = 'alpha\nbeta\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
+  const { file, ...host } = await fixture(content)
+  const hash = hashOf(await annotate(host, 'read', file, content))
   await assert.rejects(
-    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), start_anchor: 'gamma gamma gamm' }),
+    () => patch(host.tools, {
+      file_path: file,
+      file_hash: hash,
+      line_start: 2,
+      start_anchor: 'gamma gamma gamm',
+      line_end: 2,
+      end_anchor: 'beta',
+      replace: 'X',
+    }),
     error => {
       assert.match(error.message, /does not match line 2/)
-      assert.match(error.message, /which starts with "beta"/)
       assert.match(error.message, /do not reread the file/)
       return true
     },
   )
-  assert.equal(await readFile(file, 'utf8'), content)
-})
-
-test('total_lines rejects a wrong line number before any anchor check', async () => {
-  const content = 'alpha\nbeta\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  await assert.rejects(
-    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), total_lines: 7 }),
-    /total_lines mismatch/,
-  )
-})
-
-test('an empty replace deletes the range', async () => {
-  const content = 'alpha\nbeta\ngamma\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, ''))
-  assert.equal(out.line_shift, -1)
-  assert.equal(await readFile(file, 'utf8'), 'alpha\ngamma\n')
 })
 
 test('writes reach the provider with a replaceIfVersion intent', async () => {
   const content = 'alpha\nbeta\n'
-  const { file, tools, intents } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'Y'))
-  assert.equal(intents.length, 1)
-  assert.equal(intents[0].kind, 'replaceIfVersion')
+  const { file, ...host } = await fixture(content)
+  const hash = hashOf(await annotate(host, 'read', file, content))
+  await patch(host.tools, {
+    file_path: file,
+    file_hash: hash,
+    line_start: 2,
+    start_anchor: 'beta',
+    line_end: 2,
+    end_anchor: 'beta',
+    replace: 'Y',
+  })
+  assert.equal(host.intents.length, 1)
+  assert.equal(host.intents[0].kind, 'replaceIfVersion')
 })
 
-test('reads emit an observation so the policy gate sees the file as read', async () => {
-  const { file, tools, emitted } = await fixture('a\nb\n')
-  await call(tools, 'read_hash', { file_path: file })
-  const observed = emitted.find(([eventName]) => eventName === 'fs/observed')
-  assert.ok(observed, 'expected an fs/observed emission')
-  assert.equal(observed[2].kind, 'present')
-})
-
-test('a missing file fails with a clear message', async () => {
-  const { tools } = await fixture('a\n')
-  await assert.rejects(
-    () => call(tools, 'read_hash', { file_path: join(tmpdir(), 'definitely-absent-file.txt') }),
-    /file not found/,
-  )
-})
-
-test('consecutive patches only need the hash the previous patch returned', async () => {
+test('the hash changes after a patch and the next patch can chain on it', async () => {
   const content = 'one\ntwo\nthree\n'
-  const { file, tools } = await fixture(content)
-  const read = await call(tools, 'read_hash', { file_path: file })
-  const first = await call(tools, 'patch_hash', patchArgs(file, read, 2, 2, 'TWO'))
-  const second = await call(tools, 'patch_hash', {
+  const { file, ...host } = await fixture(content)
+  const first = await patch(host.tools, {
+    file_path: file,
+    file_hash: hashOf(await annotate(host, 'read', file, content)),
+    line_start: 2,
+    start_anchor: 'two',
+    line_end: 2,
+    end_anchor: 'two',
+    replace: 'TWO',
+  })
+  const second = await patch(host.tools, {
     file_path: file,
     file_hash: first.new_file_hash,
     line_start: 2,
@@ -274,4 +266,20 @@ test('consecutive patches only need the hash the previous patch returned', async
   })
   assert.equal(second.new_file_hash, fileHash('one\nTWO!\nthree\n'))
   assert.equal(await readFile(file, 'utf8'), 'one\nTWO!\nthree\n')
+})
+
+test('a missing file is reported by patch', async () => {
+  const { tools } = await fixture('a\n')
+  await assert.rejects(
+    () => patch(tools, {
+      file_path: join(tmpdir(), 'definitely-absent-file.txt'),
+      file_hash: 'abcdef',
+      line_start: 1,
+      start_anchor: 'a',
+      line_end: 1,
+      end_anchor: 'a',
+      replace: 'b',
+    }),
+    /file not found/,
+  )
 })

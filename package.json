@@ -1,7 +1,7 @@
 {
   "name": "dsh-line-patch",
   "version": "0.3.0",
-  "description": "Anchored file editing for DeepSeek Harness: read_hash hands out a whole-file hash and numbered lines, patch_hash rewrites a line range only when the whole file and both boundary-line anchors still match.",
+  "description": "Anchored line patching for DeepSeek Harness: read/write/edit results carry a short file hash, and patch rewrites a line range only when that hash and both boundary-line anchors still match.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/kingofpowers/dsh-line-patch.git"

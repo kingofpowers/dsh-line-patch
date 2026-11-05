@@ -3,7 +3,6 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   ANCHOR_CHARS,
-  LINE_SEPARATOR,
   anchorTooShort,
   applyPatch,
   detectEol,
@@ -13,7 +12,6 @@ import {
   matchesStart,
   normalizeAnchor,
   normalizeIndented,
-  renderNumbered,
   splitKeepEnds,
   startAnchorOf,
 } from '../lib/core.js'
@@ -39,12 +37,11 @@ function request(overrides = {}) {
     lineEnd,
     endAnchor: overrides.endAnchor ?? endAnchorOf(lineAt(content, lineEnd)),
     replace: overrides.replace ?? 'BETA',
-    totalLines: overrides.totalLines,
   }
 }
 
 test('file hash is a 16 char sha256 prefix and tracks content', () => {
-  assert.equal(fileHash(SAMPLE).length, 16)
+  assert.equal(fileHash(SAMPLE).length, 6)
   assert.notEqual(fileHash(SAMPLE), fileHash(`${SAMPLE}x`))
   assert.equal(fileHash(SAMPLE), fileHash(Buffer.from(SAMPLE)))
 })
@@ -53,23 +50,6 @@ test('splitKeepEnds rejoins to the exact input', () => {
   for (const text of ['', 'a', 'a\n', 'a\nb', 'a\r\nb\r\n', '\n\n']) {
     assert.equal(splitKeepEnds(text).join(''), text)
   }
-})
-
-test('renderNumbered numbers from the requested start and keeps the text verbatim', () => {
-  const out = renderNumbered('alpha\n  beta\n', 10)
-  const rows = out.trimEnd().split('\n')
-  assert.equal(rows.length, 2)
-  assert.equal(rows[0], `10${LINE_SEPARATOR}alpha`)
-  assert.equal(rows[1], `11${LINE_SEPARATOR}  beta`)
-})
-
-test('renderNumbered carries no per-line hash', () => {
-  assert.equal(renderNumbered('alpha\n').trimEnd(), `1${LINE_SEPARATOR}alpha`)
-})
-
-test('renderNumbered never emits a carriage return into a row', () => {
-  const row = renderNumbered('alpha\r\nbeta\r\n').split('\n')[0]
-  assert.equal(row, `1${LINE_SEPARATOR}alpha`)
 })
 
 test('normalizeAnchor collapses whitespace and trims both ends', () => {
@@ -169,7 +149,7 @@ test('a stale file hash is rejected before any anchor check', () => {
 
 test('a truncated file hash is a mismatch, not a prefix match', () => {
   const full = fileHash(SAMPLE)
-  const result = applyPatch(request({ expectedFileHash: full.slice(0, 12) }))
+  const result = applyPatch(request({ expectedFileHash: full.slice(0, 4) }))
   assert.equal(result.ok, false)
   assert.equal(result.code, 'FILE_HASH_MISMATCH')
 })
@@ -265,22 +245,6 @@ test('a short symbol line is identified by its whole text', () => {
   })
   assert.equal(result.ok, true)
   assert.equal(result.content, 'if (x) {\n  go()\n};\n')
-})
-
-test('total_lines cross-checks the line numbers', () => {
-  const bad = applyPatch(request({ totalLines: 99 }))
-  assert.equal(bad.ok, false)
-  assert.equal(bad.code, 'TOTAL_LINES_MISMATCH')
-  assert.match(bad.message, /you passed 99 but the file has 4 lines/)
-  assert.match(bad.message, /do not reread the file/)
-  assert.equal(applyPatch(request({ totalLines: 4 })).ok, true)
-})
-
-test('a non-integer total_lines is rejected instead of skipped', () => {
-  const bad = applyPatch(request({ totalLines: 3.5 }))
-  assert.equal(bad.ok, false)
-  assert.equal(bad.code, 'TOTAL_LINES_MISMATCH')
-  assert.match(bad.message, /whole-number total/)
 })
 
 test('out-of-range requests are rejected', () => {

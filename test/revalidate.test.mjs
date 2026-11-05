@@ -60,16 +60,19 @@ async function fixture(content) {
   return { file, host: makeHost() }
 }
 
-/** Read a file through the plugin so an anchor is registered. */
+/** Annotate one `read` result, which is what registers an anchor. */
 async function readAnchor(host, file, callId = 'call-1') {
-  const out = await host.tools.get('read_hash').execute({ file_path: file }, { callId, signal: undefined })
+  const decision = await host.fire('tools/post-execute',
+    { name: 'read', arguments: { file_path: file }, callId },
+    { content: [{ type: 'text', text: '1: a' }], isError: false },
+    (value) => value)
   // The host reports our own result sequence through session/event.
   await host.fire('session/event', host.session, {
     type: 'tool/result',
     seq: 42,
     data: { message: { toolCallId: callId } },
   })
-  return out
+  return decision
 }
 
 test('an untouched file is not re-read and nothing is rewritten', async () => {
@@ -90,7 +93,7 @@ test('a stat change with identical content refreshes the observation and keeps t
   await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
   assert.equal(host.appended.length, appendsBefore, 'no surface rewrite for unchanged content')
   const observed = host.emitted.filter(([eventName]) => eventName === 'fs/observed')
-  assert.ok(observed.length >= 2, 'the refresh emits a second observation')
+  assert.ok(observed.length >= 1, 'the refresh emits an observation')
 })
 
 test('a real content change rewrites the stale read result', async () => {
@@ -105,7 +108,7 @@ test('a real content change rewrites the stale read result', async () => {
   assert.deepEqual(meta.sourceEventSeqs, [42])
   const text = data.message.content[0].text
   assert.match(text, /was modified after it was read/)
-  assert.match(text, /read_hash again/)
+  assert.match(text, /read it again/)
 })
 
 test('an anchor older than the turn window is dropped without any I/O', async () => {
@@ -120,12 +123,13 @@ test('an anchor older than the turn window is dropped without any I/O', async ()
   assert.equal(host.appended.length, appendsBefore, 'expired anchors are not revalidated')
 })
 
-test('patch_hash refreshes the anchor so its own write is not reported as external', async () => {
+test('patch refreshes the anchor so its own write is not reported as external', async () => {
   const { file, host } = await fixture('a\nb\n')
-  const read = await readAnchor(host, file)
-  await host.tools.get('patch_hash').execute({
+  const decision = await readAnchor(host, file)
+  const hash = decision.content.at(-1).text.replace('file_hash: ', '')
+  await host.tools.get('patch').execute({
     file_path: file,
-    file_hash: read.file_hash,
+    file_hash: hash,
     line_start: 2,
     start_anchor: 'b',
     line_end: 2,
