@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   ANCHOR_CHARS,
   LINE_SEPARATOR,
+  anchorTooShort,
   applyPatch,
   detectEol,
   endAnchorOf,
@@ -11,6 +12,7 @@ import {
   matchesEnd,
   matchesStart,
   normalizeAnchor,
+  normalizeIndented,
   renderNumbered,
   splitKeepEnds,
   startAnchorOf,
@@ -62,7 +64,11 @@ test('renderNumbered numbers from the requested start and keeps the text verbati
 })
 
 test('renderNumbered carries no per-line hash', () => {
-  const row = renderNumbered('alpha\n').trimEnd()
+  assert.equal(renderNumbered('alpha\n').trimEnd(), `1${LINE_SEPARATOR}alpha`)
+})
+
+test('renderNumbered never emits a carriage return into a row', () => {
+  const row = renderNumbered('alpha\r\nbeta\r\n').split('\n')[0]
   assert.equal(row, `1${LINE_SEPARATOR}alpha`)
 })
 
@@ -70,6 +76,12 @@ test('normalizeAnchor collapses whitespace and trims both ends', () => {
   assert.equal(normalizeAnchor('   const  foo\t=  bar   '), 'const foo = bar')
   assert.equal(normalizeAnchor(''), '')
   assert.equal(normalizeAnchor(undefined), '')
+})
+
+test('normalizeIndented keeps the indentation but still collapses inner runs', () => {
+  assert.equal(normalizeIndented('    const  foo\t=  bar   '), '    const foo = bar')
+  assert.equal(normalizeIndented('x'), 'x')
+  assert.equal(normalizeIndented(''), '')
 })
 
 test('anchors are 16 characters, or the whole line when it is shorter', () => {
@@ -82,15 +94,24 @@ test('anchors are 16 characters, or the whole line when it is shorter', () => {
   assert.equal(endAnchorOf('  }'), '}')
 })
 
-test('start anchors match by prefix, ignoring indentation on either side', () => {
+test('start anchors match by prefix and ignore layout whitespace', () => {
   assert.equal(matchesStart('  const foo = bar', 'const foo'), true)
-  assert.equal(matchesStart('const foo = bar', '  const foo = ba'), true)
+  assert.equal(matchesStart('const  foo\t= bar', 'const foo = b'), true)
   assert.equal(matchesStart('const foo = bar', 'CONST'), false)
+  assert.equal(matchesStart('const foo = bar', 'foo'), false)
 })
 
-test('end anchors match by suffix, and exactly once the line is short', () => {
+test('an anchor that carries indentation is compared with indentation kept', () => {
+  assert.equal(matchesStart('    if (err) {', '    if (err) {'), true)
+  assert.equal(matchesStart('    if (err) {', '  if (err) {'), false)
+  // The nesting mistake this protects against: line 1 is not line 2.
+  assert.equal(matchesStart('if (err) {', '    if (err) {'), false)
+})
+
+test('end anchors match by suffix', () => {
   assert.equal(matchesEnd('  return compute(x)', 'compute(x)'), true)
   assert.equal(matchesEnd('  return compute(x)', 'return'), false)
+  assert.equal(matchesEnd('beta', 'eta'), true)
   assert.equal(matchesEnd('  }', '}'), true)
 })
 
@@ -99,6 +120,16 @@ test('an empty anchor means "this line is blank" and nothing else', () => {
   assert.equal(matchesEnd('   ', ''), true)
   assert.equal(matchesStart('x', ''), false)
   assert.equal(matchesEnd('x', ''), false)
+})
+
+test('anchorTooShort separates a sloppy copy from a whole short line', () => {
+  const long = 'const total = compute(a, b)'
+  assert.equal(anchorTooShort(long, 'const to'), true)
+  assert.equal(anchorTooShort(long, 'const total = com'), false)
+  assert.equal(anchorTooShort('}', '}'), false)
+  assert.equal(anchorTooShort('beta', 'beta'), false)
+  assert.equal(anchorTooShort('beta', 'be'), true)
+  assert.equal(anchorTooShort('beta', ''), false)
 })
 
 test('detectEol reports the file style', () => {
@@ -136,22 +167,55 @@ test('a stale file hash is rejected before any anchor check', () => {
   assert.match(result.message, /read it again/)
 })
 
-test('a matching file hash plus a wrong anchor is a line-number error, not a stale read', () => {
-  const badStart = applyPatch(request({ startAnchor: 'zzzz' }))
-  assert.equal(badStart.ok, false)
-  assert.equal(badStart.code, 'LINE_ANCHOR_MISMATCH')
-  assert.match(badStart.message, /line 2 does not start with "zzzz"/)
-  assert.match(badStart.message, /it starts with "beta"/)
-  assert.match(badStart.message, /Do not reread the file/)
-
-  const badEnd = applyPatch(request({ lineStart: 1, lineEnd: 2, endAnchor: 'zzzz' }))
-  assert.equal(badEnd.ok, false)
-  assert.equal(badEnd.code, 'LINE_ANCHOR_MISMATCH')
-  assert.match(badEnd.message, /line 2 does not end with "zzzz"/)
-  assert.match(badEnd.message, /it ends with "beta"/)
+test('a truncated file hash is a mismatch, not a prefix match', () => {
+  const full = fileHash(SAMPLE)
+  const result = applyPatch(request({ expectedFileHash: full.slice(0, 12) }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'FILE_HASH_MISMATCH')
 })
 
-test('anchors written with the file indentation still match', () => {
+test('an anchor that occurs mid-line is not a start anchor', () => {
+  const content = 'aaaa bbbb cccc dddd foo\nbar\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: 'bbbb cccc dddd foo',
+    lineEnd: 1,
+    endAnchor: 'bbbb cccc dddd foo',
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+})
+
+test('a wrong 16 character anchor names the real one and says not to reread', () => {
+  const result = applyPatch(request({ startAnchor: 'gamma gamma gamm' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.match(result.message, /does not match line 2/)
+  assert.match(result.message, /which starts with "beta"/)
+  assert.match(result.message, /do not reread the file/)
+})
+
+test('a wrong end anchor names the real one and says not to reread', () => {
+  const result = applyPatch(request({ lineStart: 1, lineEnd: 2, endAnchor: 'zzzz zzzz zzzz z' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.match(result.message, /does not match line 2/)
+  assert.match(result.message, /which ends with "beta"/)
+  assert.match(result.message, /do not reread the file/)
+})
+
+test('a short anchor is rejected with the length hint', () => {
+  const result = applyPatch(request({ startAnchor: 'be' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_TOO_SHORT')
+  assert.match(result.message, /is too short/)
+  assert.match(result.message, /Do not reread the file/)
+})
+
+test('anchors copied verbatim with the file indentation still match', () => {
   const content = 'function f() {\n    return 1\n}\n'
   const result = applyPatch({
     content,
@@ -166,8 +230,24 @@ test('anchors written with the file indentation still match', () => {
   assert.equal(result.content, 'function f() {\n    return 2\n}\n')
 })
 
+test('a nesting mistake is caught when the anchor carries its indentation', () => {
+  const content = 'if (err) {\n    if (err) {\n        log(err)\n    }\n}\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: '    if (err) {',
+    lineEnd: 1,
+    endAnchor: '    if (err) {',
+    replace: 'if (fatal) {',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.match(result.message, /does not match line 1/)
+})
+
 test('a single-line patch accepts the head anchor in both slots', () => {
-  const result = applyPatch(request({ startAnchor: 'be', endAnchor: 'be' }))
+  const result = applyPatch(request({ startAnchor: 'beta', endAnchor: 'beta' }))
   assert.equal(result.ok, true)
   assert.equal(result.content, 'alpha\nBETA\ngamma\ndelta\n')
 })
@@ -192,11 +272,27 @@ test('total_lines cross-checks the line numbers', () => {
   assert.equal(bad.ok, false)
   assert.equal(bad.code, 'TOTAL_LINES_MISMATCH')
   assert.match(bad.message, /you passed 99 but the file has 4 lines/)
+  assert.match(bad.message, /do not reread the file/)
   assert.equal(applyPatch(request({ totalLines: 4 })).ok, true)
 })
 
+test('a non-integer total_lines is rejected instead of skipped', () => {
+  const bad = applyPatch(request({ totalLines: 3.5 }))
+  assert.equal(bad.ok, false)
+  assert.equal(bad.code, 'TOTAL_LINES_MISMATCH')
+  assert.match(bad.message, /whole-number total/)
+})
+
 test('out-of-range requests are rejected', () => {
-  assert.equal(applyPatch(request({ lineStart: 9, lineEnd: 9 })).code, 'RANGE_INVALID')
+  const start = applyPatch(request({ lineStart: 9, lineEnd: 9 }))
+  assert.equal(start.code, 'RANGE_INVALID')
+  assert.match(start.message, /do not reread the file/)
+
+  const end = applyPatch(request({ lineStart: 2, lineEnd: 99 }))
+  assert.equal(end.code, 'RANGE_INVALID')
+  assert.match(end.message, /line_end 99 is out of range/)
+  assert.match(end.message, /do not reread the file/)
+
   const inverted = applyPatch(request({ content: SAMPLE, lineStart: 3, lineEnd: 2 }))
   assert.equal(inverted.ok, false)
   assert.equal(inverted.code, 'RANGE_INVALID')
@@ -207,6 +303,17 @@ test('a line number below 1 is rejected too', () => {
   assert.equal(result.ok, false)
   assert.equal(result.code, 'RANGE_INVALID')
   assert.match(result.message, /line_start 0 is out of range/)
+})
+
+test('non-integer line numbers and a non-string replace are bad arguments', () => {
+  const nan = applyPatch(request({ lineStart: Number.NaN, lineEnd: Number.NaN }))
+  assert.equal(nan.ok, false)
+  assert.equal(nan.code, 'BAD_ARGUMENT')
+  const float = applyPatch(request({ lineStart: 1.9, lineEnd: 2 }))
+  assert.equal(float.code, 'BAD_ARGUMENT')
+  const replace = applyPatch({ ...request(), replace: undefined })
+  assert.equal(replace.ok, false)
+  assert.equal(replace.code, 'BAD_ARGUMENT')
 })
 
 test('an empty file cannot be patched', () => {
@@ -225,10 +332,10 @@ test('an empty file cannot be patched', () => {
 })
 
 test('a single-line patch still rejects an anchor that matches nothing', () => {
-  const result = applyPatch(request({ startAnchor: 'be', endAnchor: 'zzzz' }))
+  const result = applyPatch(request({ startAnchor: 'beta', endAnchor: 'zzzz zzzz zzzz z' }))
   assert.equal(result.ok, false)
   assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
-  assert.match(result.message, /line 2 does not end with "zzzz"/)
+  assert.match(result.message, /does not match line 2/)
 })
 
 test('an empty replacement deletes the range instead of leaving a blank line', () => {
@@ -266,6 +373,12 @@ test('a final line without a newline keeps that shape', () => {
   const result = applyPatch(request({ content, lineStart: 2, lineEnd: 2, replace: 'BETA' }))
   assert.equal(result.ok, true)
   assert.equal(result.content, 'alpha\nBETA')
+})
+
+test('a replacement of just a line terminator still inserts its blank line at EOF', () => {
+  const result = applyPatch(request({ content: 'alpha\nbeta', lineStart: 2, lineEnd: 2, replace: '\n' }))
+  assert.equal(result.ok, true)
+  assert.equal(result.content, 'alpha\n\n')
 })
 
 test('replacing the last line of a newline-terminated file keeps the terminator', () => {

@@ -5,7 +5,7 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, name } from '../lib/index.js'
-import { LINE_SEPARATOR, endAnchorOf, fileHash, splitKeepEnds, startAnchorOf } from '../lib/core.js'
+import { LINE_SEPARATOR, fileHash } from '../lib/core.js'
 
 /** Build a stub plugin context exposing the host surface the plugin touches. */
 function makeCtx() {
@@ -72,15 +72,17 @@ function rowText(readOutput, lineNumber) {
   return row.slice(prefix.length)
 }
 
-/** Build patch_hash arguments whose anchors repeat what the read result showed. */
+/** Build patch_hash arguments from anchors copied literally out of the read result. */
 function patchArgs(file, readOutput, lineStart, lineEnd = lineStart, replace = 'X') {
+  const startRow = rowText(readOutput, lineStart)
+  const endRow = rowText(readOutput, lineEnd)
   return {
     file_path: file,
     file_hash: readOutput.file_hash,
     line_start: lineStart,
-    start_anchor: startAnchorOf(rowText(readOutput, lineStart)),
+    start_anchor: startRow.slice(0, 16),
     line_end: lineEnd,
-    end_anchor: endAnchorOf(rowText(readOutput, lineEnd)),
+    end_anchor: endRow.trimEnd().slice(-16),
     replace,
   }
 }
@@ -90,6 +92,17 @@ test('the plugin exports the expected shape', () => {
   assert.deepEqual(inject, ['tools', 'fs'])
 })
 
+test('the schema marks the anchor fields required and the extras optional', () => {
+  const host = makeCtx()
+  apply(host.ctx)
+  const spec = host.tools.get('patch_hash').parameters
+  for (const key of ['file_path', 'file_hash', 'line_start', 'start_anchor', 'line_end', 'end_anchor', 'replace']) {
+    assert.equal(spec[key]?.required, true, `${key} must be required`)
+  }
+  assert.equal(spec.total_lines?.required, undefined)
+  assert.equal(spec.total_lines?.type, 'number')
+})
+
 test('read_hash numbers every line, hashes the file, and adds no per-line hash', async () => {
   const { file, tools } = await fixture('alpha\nbeta\ngamma\n')
   const out = await call(tools, 'read_hash', { file_path: file })
@@ -97,6 +110,12 @@ test('read_hash numbers every line, hashes the file, and adds no per-line hash',
   assert.equal(out.total_lines, 3)
   const rows = out.content.trimEnd().split('\n')
   assert.deepEqual(rows, [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`, `3${LINE_SEPARATOR}gamma`])
+})
+
+test('read_hash keeps CRLF out of the rendered rows', async () => {
+  const { file, tools } = await fixture('alpha\r\nbeta\r\n')
+  const out = await call(tools, 'read_hash', { file_path: file })
+  assert.deepEqual(out.content.trimEnd().split('\n'), [`1${LINE_SEPARATOR}alpha`, `2${LINE_SEPARATOR}beta`])
 })
 
 test('an empty file reads as a hash and no lines', async () => {
@@ -117,6 +136,14 @@ test('read_hash honours offset and limit with absolute numbering', async () => {
   assert.equal(out.truncated, true)
 })
 
+test('an offset past the end of the file reports no rows', async () => {
+  const { file, tools } = await fixture('a\nb\n')
+  const out = await call(tools, 'read_hash', { file_path: file, offset: 9 })
+  assert.equal(out.line_count, 0)
+  assert.equal(out.content, '')
+  assert.equal(out.total_lines, 2)
+})
+
 test('patch_hash rewrites a range whose anchors came from the read result', async () => {
   const content = 'alpha\nbeta\ngamma\n'
   const { file, tools } = await fixture(content)
@@ -129,12 +156,31 @@ test('patch_hash rewrites a range whose anchors came from the read result', asyn
   assert.equal(out.new_file_hash, fileHash(after))
 })
 
+test('a rendered row can be pasted back literally, indentation and all', async () => {
+  const line = '    const total = compute(alpha, beta)   '
+  const content = `${line}\nsecond\n`
+  const { file, tools } = await fixture(content)
+  const read = await call(tools, 'read_hash', { file_path: file })
+  const row = rowText(read, 1)
+  assert.equal(row, line, 'the read result must reproduce the line verbatim')
+  const out = await call(tools, 'patch_hash', {
+    file_path: file,
+    file_hash: read.file_hash,
+    line_start: 1,
+    start_anchor: row.slice(0, 16),
+    line_end: 1,
+    end_anchor: row.trimEnd().slice(-16),
+    replace: 'const total = 0',
+  })
+  assert.equal(out.line_shift, 0)
+  assert.equal(await readFile(file, 'utf8'), 'const total = 0\nsecond\n')
+})
+
 test('a multi-line patch uses both boundary lines', async () => {
   const content = 'alpha\nbeta\ngamma\ndelta\n'
   const { file, tools } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
-  const args = patchArgs(file, read, 2, 3, 'one\ntwo\nthree')
-  const out = await call(tools, 'patch_hash', args)
+  const out = await call(tools, 'patch_hash', patchArgs(file, read, 2, 3, 'one\ntwo\nthree'))
   assert.equal(out.line_shift, 1)
   assert.equal(await readFile(file, 'utf8'), 'alpha\none\ntwo\nthree\ndelta\n')
 })
@@ -145,7 +191,7 @@ test('patch_hash refuses a stale file hash and leaves the file untouched', async
   const read = await call(tools, 'read_hash', { file_path: file })
   await assert.rejects(
     () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), file_hash: 'deadbeefdeadbeef' }),
-    /file_hash mismatch/,
+    /file_hash mismatch.*read it again/,
   )
   assert.equal(await readFile(file, 'utf8'), content)
 })
@@ -155,10 +201,11 @@ test('a wrong line number is reported as an anchor error that says not to reread
   const { file, tools } = await fixture(content)
   const read = await call(tools, 'read_hash', { file_path: file })
   await assert.rejects(
-    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), start_anchor: 'gamma' }),
+    () => call(tools, 'patch_hash', { ...patchArgs(file, read, 2, 2, 'X'), start_anchor: 'gamma gamma gamm' }),
     error => {
-      assert.match(error.message, /does not start with "gamma"/)
-      assert.match(error.message, /Do not reread the file/)
+      assert.match(error.message, /does not match line 2/)
+      assert.match(error.message, /which starts with "beta"/)
+      assert.match(error.message, /do not reread the file/)
       return true
     },
   )
@@ -225,8 +272,4 @@ test('consecutive patches only need the hash the previous patch returned', async
   })
   assert.equal(second.new_file_hash, fileHash('one\nTWO!\nthree\n'))
   assert.equal(await readFile(file, 'utf8'), 'one\nTWO!\nthree\n')
-})
-
-test('splitKeepEnds is the line model the plugin exposes', () => {
-  assert.equal(splitKeepEnds('a\r\nb').length, 2)
 })
