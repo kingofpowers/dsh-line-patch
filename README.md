@@ -134,7 +134,7 @@ stat 预筛（微秒级，不读文件）
 
 0.2.x 在真实宿主上验证过替换、行位移、过期 `file_hash`、`replace: ""` 与 `replaceIfVersion` intent；0.3.0 的 hash 标注、锚点匹配、空白宽容、缩进严格性、短行/空行、EOF/BOF、错误分流由离线测试覆盖。
 
-离线测试：`npm test` — 83 个用例（核心逻辑 54 + 工具胶水 22 + 锚点核实 7），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
+离线测试：`npm test` — 86 个用例（核心逻辑 55 + 工具胶水 23 + 锚点核实 8），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
 
 0.3.0 **尚未在真实宿主上做端到端验证**：`tools/post-execute` 的行为是按宿主源码（`dsh-tools` 0.2.1-rc.5）核对的，首次装进 desktop profile 时应当先跑一遍 `read` → `patch`。
 

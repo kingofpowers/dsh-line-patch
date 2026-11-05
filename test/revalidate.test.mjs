@@ -62,12 +62,12 @@ async function fixture(content) {
 }
 
 /** Annotate one `read` result, which is what registers an anchor. */
-async function readAnchor(host, file, callId = 'call-1') {
+async function readAnchor(host, file, callId = 'call-1', downstream = () => ({ kind: 'accept' })) {
   const decision = await host.fire('tools/post-execute',
     { name: 'read', arguments: { file_path: file }, callId },
     { content: [{ type: 'text', text: '1: a' }], isError: false },
     // Cordis waterfall: `next()` takes no arguments and returns the downstream decision.
-    () => ({ kind: 'accept' }))
+    downstream)
   // The host reports our own result sequence through session/event.
   await host.fire('session/event', host.session, {
     type: 'tool/result',
@@ -76,6 +76,14 @@ async function readAnchor(host, file, callId = 'call-1') {
   })
   return decision
 }
+
+test('a blocked read is not tracked and is never rewritten', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await readAnchor(host, file, 'call-1', () => ({ kind: 'block', feedback: [{ type: 'text', text: 'denied by policy' }] }))
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.fire('agent/request', { turn: 1, step: 1, agent: {} }, () => 'next')
+  assert.equal(host.appended.length, 0, 'a policy block must not be replaced by a stale-read notice')
+})
 
 test('an untouched file is not re-read and nothing is rewritten', async () => {
   const { file, host } = await fixture('a\nb\n')

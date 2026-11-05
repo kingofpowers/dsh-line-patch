@@ -1,7 +1,7 @@
 /** Glue tests: the hash annotation and the `patch` tool against a stub host. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject, name } from '../lib/index.js'
@@ -182,11 +182,16 @@ test('a read result gains the current file hash in its existing block', async ()
 
 test('a relative path resolves against the session working directory', async () => {
   const { file, ...host } = await fixture('alpha\n')
-  host.setWorkingDirectory({ ensure: async () => '/session/dir' })
-  await annotate(host, 'read', file, '1: alpha', { agent: { id: 'agent-1' } })
+  const ensureCalls = []
+  const signal = new AbortController().signal
+  host.setWorkingDirectory({
+    ensure: async (agent, given) => { ensureCalls.push({ agent, signal: given }); return '/session/dir' },
+  })
+  await annotate(host, 'read', file, '1: alpha', { agent: { id: 'agent-1' }, signal })
   const call = host.resolveCalls.at(-1)
   assert.equal(call.options.cwd, '/session/dir', 'the hash must describe the file the tool resolved')
-  assert.equal(call.options.signal, undefined)
+  assert.equal(call.options.signal, signal, 'cancellation must reach the provider')
+  assert.deepEqual(ensureCalls, [{ agent: { id: 'agent-1' }, signal }], 'the agent must be forwarded')
 })
 
 test('a file that moved between the tool and the hook is not annotated', async () => {
@@ -194,6 +199,15 @@ test('a file that moved between the tool and the hook is not annotated', async (
   await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version: 'the-version-the-tool-saw' })
   const decision = await annotate(host, 'read', file, '1: alpha')
   assert.equal(decision.content, undefined, 'a hash for unseen bytes must not be handed out')
+})
+
+test('a matching observation still annotates, as it does in the real host', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  const stats = await stat(file)
+  const version = `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}`
+  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version })
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.equal(hashOf(decision), fileHash('alpha\n'), 'the normal path must not be suppressed')
 })
 
 test('a patch emits an observation for the file it wrote', async () => {

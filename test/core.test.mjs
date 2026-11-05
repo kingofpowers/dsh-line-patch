@@ -447,6 +447,25 @@ test('the suggested widening is itself unique, even past the old 80-character ca
   assert.equal(secondTry.ok, true, 'following the suggestion must succeed without a reread')
 })
 
+test('an ambiguity that is only resolvable past the visible line length is allowed', () => {
+  // The read display truncates at 2,000 characters, so a unique prefix beyond
+  // that is text the model never saw; suggesting it would be a trap.
+  const shared = 'x'.repeat(2500)
+  const first = `${shared}-alpha`
+  const second = `${shared}-omega`
+  const content = `${first}\n${second}\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: shared.slice(0, 16),
+    lineEnd: 2,
+    endAnchor: second.slice(-16),
+    replace: 'y',
+  })
+  assert.equal(result.ok, true, 'no suggestion is possible, so the line number decides')
+})
+
 test('a short end anchor is rejected with the length hint', () => {
   const result = applyPatch(request({ lineStart: 1, lineEnd: 1, endAnchor: 'lpha' }))
   assert.equal(result.ok, false)
