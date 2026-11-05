@@ -17,11 +17,13 @@
 
 同时它和 DSH 内置的版本守卫**互补而非重复**：
 
-| 场景 | 内置 stat 版本 | 本插件 file_hash |
+| 场景 | 内置 stat 版本（本机 provider：`dev:ino:size:mtimeNs:ctimeNs`） | 本插件 file_hash |
 |---|---|---|
-| 内容改了且 mtime 变了 | 拒绝 ✅ | 拒绝 ✅ |
-| 内容改了但 mtime/size 没变（`cp -p`、备份还原） | **漏判 ❌** | 拒绝 ✅ |
-| 内容没变只是被 touch / 重新构建 | **误伤 ❌** | 放行 ✅ |
+| 内容改了 | 拒绝 ✅ | 拒绝 ✅ |
+| 版本只含 mtime/size 的 provider 上，内容改了而 mtime/size 未变（`cp -p`、备份还原） | **漏判 ❌** | 拒绝 ✅ |
+| 内容没变只是被 touch / 重新构建 | **误伤 ❌**（版本变了） | 放行 ✅（内容一致） |
+
+本机 provider 的版本含 `ctimeNs`，而写文件必然改 ctime，所以「改了内容却版本不变」只会在粗时间戳文件系统或自定义 provider 上出现；`file_hash` 的价值是**不依赖 provider 的版本语义**：内容一样就放行，内容不一样就拒绝。它也正好是 `patch` 能在不重读的前提下自纠的依据（见「失败怎么读」）。
 
 ### 为什么不是逐行 hash
 
@@ -75,7 +77,7 @@ patch {
 - 空白行用空字符串 `""` 作锚点；缩进超过 16 列的行，前 16 字符全是空白，工具会提示改从第一个非空白字符开始抄。
 - 单行修改（`line_start == line_end`）两个锚点落在同一行：`start_anchor` 按前缀比，`end_anchor` 允许后缀或前缀。
 - 锚点必须抄满（16 字符，或整行），只抄前几个字符会被 `ANCHOR_TOO_SHORT` 拒绝。
-- 若 16 字符锚点同时命中多行（例如两行都以 `const value = co` 开头），工具会以 `ANCHOR_AMBIGUOUS` 拒绝，并给出**可以照抄的更长锚点**——照它再发一次即可，不必重读。整行都重复的行无法靠内容区分，按行号执行（与 0.2.0 的整行 hash 同样只能靠概率）。
+- 若 16 字符锚点同时命中多行（例如两行都以 `const value = co` 开头），工具会以 `ANCHOR_AMBIGUOUS` 拒绝，并给出**已保证唯一的更长锚点**（可能是整行）——照它再发一次即可，不必重读。start 和 end 各有一个歧义时，各需要一次重发。
 - `replace: ""` 删除该行区间；`line_shift` 给出位移，连续修改不必整段重读。
 - CRLF 文件按原风格写回；末行无换行符的状态保持。
 
@@ -132,7 +134,7 @@ stat 预筛（微秒级，不读文件）
 
 0.2.x 在真实宿主上验证过替换、行位移、过期 `file_hash`、`replace: ""` 与 `replaceIfVersion` intent；0.3.0 的 hash 标注、锚点匹配、空白宽容、缩进严格性、短行/空行、EOF/BOF、错误分流由离线测试覆盖。
 
-离线测试：`npm test` — 82 个用例（核心逻辑 53 + 工具胶水 22 + 锚点核实 7），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
+离线测试：`npm test` — 83 个用例（核心逻辑 54 + 工具胶水 22 + 锚点核实 7），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
 
 0.3.0 **尚未在真实宿主上做端到端验证**：`tools/post-execute` 的行为是按宿主源码（`dsh-tools` 0.2.1-rc.5）核对的，首次装进 desktop profile 时应当先跑一遍 `read` → `patch`。
 
@@ -153,6 +155,8 @@ stat 预筛（微秒级，不读文件）
 
   整文件 hash 对这两种情况同样无能为力（它只证明「文件没变」）。带缩进一起抄能把「只差缩进」的那类行分开（缩进 ≥16 列的行例外，见上文）。
 - 追加 hash 依赖宿主提供 `tools/post-execute`；宿主没有这个 waterfall 时 `read` 不带 hash，`patch` 也就无法使用（不会静默改错）。
+- 「版本守卫」只在 provider 广播 `fs/observed` 且带版本时生效；不广播的 provider 上插件会直接标注（此时只剩 `patch` 自己的内容 hash 校验）。
+- **带 hash 的 `read` 结果在 Web UI 里会退化成通用文本卡片**（代码高亮/行号卡片需要结果文本以 `</content>` 结尾，追加的一行破坏了该判定）。只影响显示，不影响模型看到的文本。
 - **PTC（`run_code`）模式拿不到这个 hash**：程序侧只收到工具的 `{ isError, value }`，而内置 `read` 的 value schema（`additionalProperties: false`）里没有 hash 字段，插件无法追加。PTC 会话里请直接用 `edit`/`write`。
 - 若文件在「工具读取」与「插件复核」之间被改，插件不标注 hash（见实现要点）；更窄的窗口（插件 stat 之后、写入之前）仍由 provider 版本 CAS 兜底。
 - `fs/write-intent` 不可用时退化为自行构造的 `replaceIfVersion`；再被 provider 忽略时该次写入没有 CAS 保护。

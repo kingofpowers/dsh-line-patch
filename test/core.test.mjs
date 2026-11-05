@@ -417,6 +417,36 @@ test('repeated short symbols stay editable', () => {
   assert.equal(result.ok, true)
 })
 
+test('the suggested widening is itself unique, even past the old 80-character cap', () => {
+  const shared = 'x'.repeat(100)
+  const first = `${shared}-alpha-tail-${'y'.repeat(60)}`
+  const second = `${shared}-omega-tail-${'z'.repeat(60)}`
+  const content = `${first}\n${second}\n`
+  const firstTry = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: shared.slice(0, 16),
+    lineEnd: 2,
+    endAnchor: second.slice(-16),
+    replace: 'x',
+  })
+  assert.equal(firstTry.code, 'ANCHOR_AMBIGUOUS')
+  const suggestion = /for example (".*?")\./.exec(firstTry.message)?.[1]
+  assert.ok(suggestion, 'the message must print a copyable anchor')
+  const widened = JSON.parse(suggestion)
+  const secondTry = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 2,
+    startAnchor: widened,
+    lineEnd: 2,
+    endAnchor: second.slice(-16),
+    replace: 'x',
+  })
+  assert.equal(secondTry.ok, true, 'following the suggestion must succeed without a reread')
+})
+
 test('a short end anchor is rejected with the length hint', () => {
   const result = applyPatch(request({ lineStart: 1, lineEnd: 1, endAnchor: 'lpha' }))
   assert.equal(result.ok, false)
