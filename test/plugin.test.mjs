@@ -142,6 +142,8 @@ test('an offset past the end of the file reports no rows', async () => {
   assert.equal(out.line_count, 0)
   assert.equal(out.content, '')
   assert.equal(out.total_lines, 2)
+  const rendered = tools.get('read_hash').output.render({}, out)[0].text
+  assert.equal(rendered, `file_hash: ${fileHash('a\nb\n')}\nno lines at offset 9 (file has 2 lines)`)
 })
 
 test('patch_hash rewrites a range whose anchors came from the read result', async () => {

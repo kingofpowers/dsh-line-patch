@@ -338,6 +338,127 @@ test('a single-line patch still rejects an anchor that matches nothing', () => {
   assert.match(result.message, /does not match line 2/)
 })
 
+test('a wrong end anchor that shares the tail of the line is still rejected', () => {
+  const content = 'const value = zzzzzzzz\nnext\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: startAnchorOf('const value = zzzzzzzz'),
+    lineEnd: 1,
+    endAnchor: 'yyyyyyyyzzzzzzzz',
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+})
+
+test('a short end anchor is rejected with the length hint', () => {
+  const result = applyPatch(request({ lineStart: 1, lineEnd: 1, endAnchor: 'lpha' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_TOO_SHORT')
+  assert.match(result.message, /end_anchor/)
+  assert.match(result.message, /is too short/)
+  assert.match(result.message, /Do not reread the file/)
+})
+
+test('a single-line patch on a long line accepts the head slice in both slots', () => {
+  const content = 'const total = compute(a, b, c)\nnext\n'
+  const anchor = 'const total = com'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: anchor,
+    lineEnd: 1,
+    endAnchor: anchor,
+    replace: 'const total = 0',
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.content, 'const total = 0\nnext\n')
+})
+
+test('an end mismatch on a long line echoes its real end anchor', () => {
+  const line = 'aaaa bbbb cccc dddd eeee'
+  const content = `${line}\nnext\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: startAnchorOf(line),
+    lineEnd: 1,
+    endAnchor: 'xxxx xxxx xxxx xxxx',
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.ok(
+    result.message.includes(JSON.stringify(endAnchorOf(line))),
+    `message must echo ${JSON.stringify(endAnchorOf(line))}: ${result.message}`,
+  )
+  assert.ok(!result.message.includes(JSON.stringify(startAnchorOf(line))))
+})
+
+test('a blank anchor on a non-blank line is named as blank', () => {
+  const result = applyPatch(request({ startAnchor: '' }))
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'LINE_ANCHOR_MISMATCH')
+  assert.match(result.message, /start_anchor \(blank\) does not match line 2/)
+  assert.match(result.message, /which starts with "beta"/)
+})
+
+test('a start anchor that is only whitespace asks for a slice with content', () => {
+  const content = `${' '.repeat(20)}return value\nnext\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: ' '.repeat(16),
+    lineEnd: 1,
+    endAnchor: endAnchorOf('return value'),
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_TOO_SHORT')
+  assert.match(result.message, /only whitespace/)
+})
+
+test('an end anchor that is only whitespace asks for a slice with content', () => {
+  const content = `return value${' '.repeat(20)}\nnext\n`
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: 'return value',
+    lineEnd: 1,
+    endAnchor: ' '.repeat(16),
+    replace: 'x',
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'ANCHOR_TOO_SHORT')
+  assert.match(result.message, /only whitespace/)
+})
+
+test('a mismatch caused only by indentation shows both strings', () => {
+  const content = 'if (err) {\n    if (err) {\n        log(err)\n    }\n}\n'
+  const result = applyPatch({
+    content,
+    expectedFileHash: fileHash(content),
+    lineStart: 1,
+    startAnchor: '    if (err) {',
+    lineEnd: 1,
+    endAnchor: '    if (err) {',
+    replace: 'if (fatal) {',
+  })
+  assert.match(result.message, /"    if \(err\) \{"/)
+  assert.match(result.message, /which starts with "if \(err\) \{"/)
+})
+
+test('inner whitespace runs on the line side are still matched', () => {
+  assert.equal(matchesStart('const   value\t=  1', 'const value = 1'), true)
+  assert.equal(matchesEnd('return   value\t;', 'value ;'), true)
+})
+
 test('an empty replacement deletes the range instead of leaving a blank line', () => {
   const result = applyPatch(request({ lineStart: 2, lineEnd: 3, replace: '' }))
   assert.equal(result.ok, true)
