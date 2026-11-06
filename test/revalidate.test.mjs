@@ -112,18 +112,19 @@ test('a touch with identical content refreshes the observation without a notice'
   assert.equal(host.reads(), readsAfterRefresh, 'the refreshed version must be remembered')
 })
 
-test('a real change appends one notice naming the file and both hashes', async () => {
+test('a real change appends one notice naming the file and no hashes', async () => {
   const { file, host } = await fixture('a\nb\n')
-  const before = await anchorFrom(host, file)
-  const oldHash = /(?:^|\n)file_hash: ([0-9a-f]+)$/.exec(before.content.at(-1).text)[1]
+  await anchorFrom(host, file)
   await writeFile(file, 'a\nCHANGED\n')
   const decision = await host.preStep()
   const notices = noticesOf(decision)
   assert.equal(notices.length, 1)
   assert.match(notices[0], /\[line-patch\] 1 file has changed since you last read or wrote it/)
   assert.match(notices[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
-  assert.match(notices[0], new RegExp(`file_hash ${oldHash} -> [0-9a-f]{6}`))
-  assert.match(notices[0], /re-read before patching/)
+  assert.match(notices[0], /Re-read a file before patching it/)
+  // Handing over the new hash would let a model pair it with stale line numbers.
+  assert.doesNotMatch(notices[0], /file_hash\s+[0-9a-f]{6}\s*->/, 'the notice must not print a hash transition')
+  assert.doesNotMatch(notices[0], /[0-9a-f]{6}/, 'the notice must not print any hash at all')
 })
 
 test('the notice is not repeated until the content changes again', async () => {
@@ -148,12 +149,12 @@ test('an older anchor is dropped without a notice', async () => {
 
 test('a write result is tracked too, so its stale hash is announced', async () => {
   const { file, host } = await fixture('a\nb\n')
-  const decision = await anchorFrom(host, file, 'write')
-  const hash = /(?:^|\n)file_hash: ([0-9a-f]+)$/.exec(decision.content.at(-1).text)[1]
+  await anchorFrom(host, file, 'write')
   await writeFile(file, 'a\nREWRITTEN\n')
   const notices = noticesOf(await host.preStep())
   assert.equal(notices.length, 1)
-  assert.match(notices[0], new RegExp(`file_hash ${hash} -> `))
+  assert.match(notices[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
+  assert.doesNotMatch(notices[0], /[0-9a-f]{6}/, 'no hash is disclosed')
 })
 
 test('an aborted step adds no notice', async () => {
@@ -162,6 +163,17 @@ test('an aborted step adds no notice', async () => {
   await writeFile(file, 'a\nCHANGED\n')
   const decision = await host.preStep({ signal: { aborted: true } })
   assert.deepEqual(noticesOf(decision), [])
+})
+
+test('one line per file even when read and patched both touched it', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file, 'read')
+  await anchorFrom(host, file, 'patch')
+  await writeFile(file, 'a\nCHANGED\n')
+  const notices = noticesOf(await host.preStep())
+  assert.equal(notices.length, 1)
+  const lines = notices[0].split('\n').filter(line => line.startsWith('- '))
+  assert.equal(lines.length, 1, 'the file list is deduplicated')
 })
 
 test('two changed files are reported in one notice', async () => {
