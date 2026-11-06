@@ -196,16 +196,25 @@ test('a relative path resolves against the session working directory', async () 
 
 test('a file that moved between the tool and the hook is not annotated', async () => {
   const { file, ...host } = await fixture('alpha\n')
-  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version: 'the-version-the-tool-saw' })
+  // The baseline is per tool call: the observation carries the callId of the
+  // execution being finalized.
+  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version: 'the-version-the-tool-saw' }, { callId: 'call-1' })
   const decision = await annotate(host, 'read', file, '1: alpha')
   assert.equal(decision.content, undefined, 'a hash for unseen bytes must not be handed out')
+})
+
+test('an observation from another call does not suppress this annotation', async () => {
+  const { file, ...host } = await fixture('alpha\n')
+  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version: 'stale-baseline' }, { callId: 'call-other' })
+  const decision = await annotate(host, 'read', file, '1: alpha')
+  assert.equal(hashOf(decision), fileHash('alpha\n'), 'a concurrent call must not launder its version into this result')
 })
 
 test('a matching observation still annotates, as it does in the real host', async () => {
   const { file, ...host } = await fixture('alpha\n')
   const stats = await stat(file)
   const version = `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}`
-  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version })
+  await fire(host, 'fs/observed', { targetKey: file }, { kind: 'present', version }, { callId: 'call-1' })
   const decision = await annotate(host, 'read', file, '1: alpha')
   assert.equal(hashOf(decision), fileHash('alpha\n'), 'the normal path must not be suppressed')
 })

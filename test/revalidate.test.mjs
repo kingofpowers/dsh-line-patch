@@ -82,6 +82,8 @@ function makeHost() {
   }
 
   openSession('s1')
+  const unreadable = new Set()
+  const forcedSize = new Map()
   const sessionOf = (id) => sessions.get(id) ?? openSession(id)
   const agentOf = (id = 's1') => ({ id: `agent-${id}`, session: sessionOf(id) })
 
@@ -103,9 +105,13 @@ function makeHost() {
       async stat(target) {
         const stats = await import('node:fs/promises').then(m => m.stat(target.targetKey)).catch(() => undefined)
         if (!stats) return undefined
-        return { type: 'file', size: stats.size, version: `${stats.size}:${stats.mtimeMs}` }
+        return { type: 'file', size: forcedSize.get(target.targetKey) ?? stats.size, version: `${stats.size}:${stats.mtimeMs}` }
       },
-      async readText(target) { reads += 1; return readFile(target.targetKey, 'utf8') },
+      async readText(target) {
+        if (unreadable.has(target.targetKey)) throw new Error('FS_NOT_TEXT: binary file')
+        reads += 1
+        return readFile(target.targetKey, 'utf8')
+      },
       async writeText(target, content) {
         await writeFile(target.targetKey, content)
         const after = await import('node:fs/promises').then(m => m.stat(target.targetKey))
@@ -136,15 +142,24 @@ function makeHost() {
       decision = await handler(payload, next)
     }
     decision ??= { kind: 'accept', messages: [] }
-    for (const message of decision.messages ?? []) {
-      session.append('user/message', message, { surfaceOp: 'append' })
+    // `override.abandon` models a host that aborts right after the waterfall:
+    // the decision is returned but its messages are never committed.
+    if (!override.abandon) {
+      for (const message of decision.messages ?? []) {
+        session.append('user/message', message, { surfaceOp: 'append' })
+      }
     }
     // Let the queued session/event callbacks settle before assertions run.
     await new Promise(resolve => setTimeout(resolve, 0))
     return decision
   }
 
-  return { ctx, tools, emitted, appended, sessions, fire, preStep, reads: () => reads, listeners }
+  return {
+    ctx, tools, emitted, appended, sessions, fire, preStep, listeners,
+    reads: () => reads,
+    markUnreadable: (path) => unreadable.add(path),
+    forceSize: (path, size) => forcedSize.set(path, size),
+  }
 }
 
 /** Create a temp file bound to a stub host. */
@@ -679,6 +694,45 @@ test('another session writing the file does not silence this session', async () 
   assert.ok(hash)
 })
 
+
+test('a notice the host never commits is announced again', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  // The step aborts after the waterfall, so the decision is dropped.
+  await host.preStep('s1', { abandon: true })
+  assert.equal(appendedTexts(host).length, 0)
+  // The same stale set must not be suppressed by a message that never landed.
+  const decision = await host.preStep()
+  assert.equal(decision.messages.length, 1)
+  assert.match(decision.messages[0].content[0].text, /1 file has changed/)
+})
+
+test('an unreadable changed file blocks the all-clear', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  // The file becomes binary (or unreadable): the plugin cannot prove anything.
+  host.markUnreadable(file)
+  await host.preStep()
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1)
+  assert.doesNotMatch(texts[0], /No files changed/)
+})
+
+test('an oversized file is not read during the scan and blocks the all-clear', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  host.forceSize(file, 64 * 1024 * 1024)
+  const readsBefore = host.reads()
+  await host.preStep()
+  assert.equal(host.reads(), readsBefore, 'the scan must not pull a 64 MB file into memory')
+  assert.doesNotMatch(appendedTexts(host)[0], /No files changed/)
+})
 
 test('sessions never see each other\'s anchors or notices', async () => {
   const { file, host } = await fixture('a\nb\n')
