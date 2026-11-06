@@ -439,6 +439,21 @@ test('re-reading a file keeps its anchor alive past the eviction window', async 
   assert.match(appendedTexts(host)[0], /sample\.txt/)
 })
 
+test('a shadowed notice is re-announced even when the notice text would be identical', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  const notice = host.appended[0]
+  host.sessions.get('s1').shadow(notice.seq)
+  // Same stale set, so the notice text would be byte-identical — but the
+  // message the model can see is gone, so silence here is a false all-clear.
+  await writeFile(file, 'a\nCHANGED\nAGAIN\n')
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 2)
+  assert.equal(host.appended[1].surfaceOp, 'append')
+})
+
 test('sessions never see each other\'s anchors or notices', async () => {
   const { file, host } = await fixture('a\nb\n')
   const dir = await mkdtemp(join(tmpdir(), 'line-patch-rev4-'))
