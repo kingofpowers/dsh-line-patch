@@ -708,29 +708,32 @@ test('a notice the host never commits is announced again', async () => {
   assert.match(decision.messages[0].content[0].text, /1 file has changed/)
 })
 
-test('an unreadable changed file blocks the all-clear', async () => {
+test('a large changed file is reported from its stat, without being read', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
-  await writeFile(file, 'a\nCHANGED\n')
-  await host.preStep()
-  // The file becomes binary (or unreadable): the plugin cannot prove anything.
-  host.markUnreadable(file)
-  await host.preStep()
-  await host.preStep()
-  const texts = appendedTexts(host)
-  assert.equal(texts.length, 1)
-  assert.doesNotMatch(texts[0], /No files changed/)
-})
-
-test('an oversized file is not read during the scan and blocks the all-clear', async () => {
-  const { file, host } = await fixture('a\nb\n')
-  await anchorFrom(host, file)
-  await writeFile(file, 'a\nCHANGED\n')
-  await host.preStep()
+  // Simulate a file that grew past the confirmation threshold and changed.
   host.forceSize(file, 64 * 1024 * 1024)
+  await writeFile(file, 'a\nCHANGED\n')
   const readsBefore = host.reads()
   await host.preStep()
   assert.equal(host.reads(), readsBefore, 'the scan must not pull a 64 MB file into memory')
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1)
+  assert.match(texts[0], /1 file has changed/)
+  assert.doesNotMatch(texts[0], /No files changed/)
+})
+
+test('an unreadable changed file is reported, never cleared', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  host.markUnreadable(file)
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1, 'an unreadable file cannot prove it is unchanged')
+  assert.match(texts[0], /1 file has changed/)
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1)
   assert.doesNotMatch(appendedTexts(host)[0], /No files changed/)
 })
 

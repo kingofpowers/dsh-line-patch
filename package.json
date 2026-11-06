@@ -1,6 +1,6 @@
 {
   "name": "dsh-line-patch",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Anchored line patching for DeepSeek Harness: read/write/edit results carry a short file hash, and patch rewrites a line range only when that hash and both boundary-line anchors still match.",
   "repository": {
     "type": "git",
