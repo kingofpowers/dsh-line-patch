@@ -454,6 +454,65 @@ test('a shadowed notice is re-announced even when the notice text would be ident
   assert.equal(host.appended[1].surfaceOp, 'append')
 })
 
+test('an aged-out anchor never clears the warning, even on later steps', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  for (let index = 0; index < 4; index += 1) {
+    await host.fire('session/event', host.sessions.get('s1'), { seq: 200 + index, type: 'turn/start' })
+  }
+  await host.preStep()
+  await host.preStep()
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1, 'the warning must survive every later step, not just one')
+  assert.doesNotMatch(texts[0], /No files changed/)
+})
+
+test('an adopted notice is not cleared while it has no evidence', async () => {
+  const { host } = await fixture('a\nb\n')
+  host.sessions.get('s1').seedNotice('[line-patch] 1 file has changed since you last read or wrote it:\n- old.txt\nvoid.')
+  await host.preStep()
+  await host.preStep()
+  assert.deepEqual(appendedTexts(host), [], 'a fork seed is not evidence the file was re-read')
+})
+
+test('evicting an anchor does not clear the warning', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-evict2-'))
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  for (let index = 0; index < 40; index += 1) {
+    const other = join(dir, `e${index}.txt`)
+    await writeFile(other, `${index}\n`)
+    await anchorFrom(host, other)
+  }
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1, 'losing the anchor is not the same as the file being re-read')
+  assert.doesNotMatch(texts[0], /No files changed/)
+})
+
+test('a write in another session leaves the warning intact', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file, 'read', 's1')
+  await writeFile(file, 'a\nEXTERNAL\n')
+  await host.preStep('s1')
+  assert.equal(appendedTexts(host, 's1').length, 1)
+  // Session s2 writes the same file: s1 must still be able to report the
+  // change, so its anchor must not be dropped by another session's write.
+  const post = host.listeners.get('tools/post-execute')[0]
+  await post(
+    { name: 'write', arguments: { file_path: file }, callId: 'w1', agent: { id: 'agent-s2', session: host.sessions.get('s2') } },
+    { content: [{ type: 'text', text: 'written' }], isError: false },
+    () => ({ kind: 'accept' }),
+  )
+  await host.preStep('s1')
+  assert.equal(appendedTexts(host, 's1').length, 1, 'no false all-clear for the other session')
+})
+
 test('sessions never see each other\'s anchors or notices', async () => {
   const { file, host } = await fixture('a\nb\n')
   const dir = await mkdtemp(join(tmpdir(), 'line-patch-rev4-'))
