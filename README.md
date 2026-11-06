@@ -121,7 +121,7 @@ stat 预筛（微秒级，不读文件）
 
 这样做还有个副作用是好的：内置的 stat 版本守卫会把「内容没变但 mtime 变了」误判为外部修改，这里用内容 hash 纠正它，模型不必因为一次 rebuild 就重读整个文件。
 
-> 0.3.1 起改用 `agent/pre-step`。0.3.0 用的 `agent/request` 在 DSH 0.2.2-rc.1 中已被移除，导致漂移检测在 0.2.2 上静默失效；`agent/pre-step` 在 0.2.1 与 0.2.2 上都存在。
+> 0.3.1 起改用 `agent/pre-step`。0.3.0 用的 `agent/request` 在 DSH 0.2.2-rc.1 里已被标成 deprecated（`dsh-agent` 的类型注释写明 "Retained for existing listeners; do not add new listeners"），派发仍在，但受支持的通道是 `agent/pre-step`——它在 0.2.1-rc.1、0.2.1-rc.5、0.2.2-rc.1 上都存在，语义一致。
 
 ## 实现要点
 
@@ -146,7 +146,7 @@ stat 预筛（微秒级，不读文件）
 
 另外，0.3.0 新增了 `engines.dsh: ">=0.2.1-rc.1 <0.3.0"`。这不只是元数据：声明了 `engines.dsh` 之后，插件管理器只按这一条判断，`peerDependencies` 不再兜底——装到范围外的宿主上会被直接拒绝。
 
-**0.3.1**：漂移检测从 `agent/request` 迁到 `agent/pre-step`（前者在 DSH 0.2.2-rc.1 已被移除），并从「原地替换旧结果」改成「追加一条通知」，因此 read/write/edit/patch 的 hash 都会被覆盖，且不再改写任何历史内容。工具契约不变，无需迁移。
+**0.3.1**：漂移检测从 `agent/request` 迁到 `agent/pre-step`（前者在 0.2.2-rc.1 起 deprecated），并从「原地替换旧结果」改成「追加一条通知」，因此 read/write/edit/patch 的 hash 都会被覆盖，且不再改写任何历史内容。工具契约不变，无需迁移。
 
 ## 已验证
 
