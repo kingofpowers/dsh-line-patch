@@ -1,18 +1,28 @@
-/** Drift detection: the pre-step check that tells the model its hashes went stale. */
+/** Drift detection: the single pre-step notice that is replaced as state changes. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
 
-/** Stub host that records listeners so tests can fire them deterministically. */
+/** Stub host that records listeners and the session's append stream. */
 function makeHost() {
   const tools = new Map()
   const listeners = new Map()
   const emitted = []
+  const appended = []
   const resolveCalls = []
   let reads = 0
+  let seq = 0
+  const session = {
+    append: (type, data, meta = {}) => {
+      seq += 1
+      const event = { seq, type, data, ...meta }
+      appended.push(event)
+      return event
+    },
+  }
   const ctx = {
     tools: { register: (definition) => { tools.set(definition.name, definition) } },
     on: (name, handler) => {
@@ -50,22 +60,25 @@ function makeHost() {
   }
 
   /**
-   * Run one `agent/pre-step` waterfall the way the host does: `next()` takes no
-   * arguments and returns the downstream decision, whose `messages` array is
-   * where a listener appends its notice.
+   * Run one `agent/pre-step` waterfall the way the host does: the listener
+   * returns a decision whose `messages` the host then appends to the session.
    */
-  const preStep = async (step = {}) => {
-    let result
+  const preStep = async (override = {}) => {
+    const payload = { agent: { id: 'agent-1' }, messages: [], signal: { aborted: false }, step: 1, ...override }
+    let decision
     for (const handler of listeners.get('agent/pre-step') ?? []) {
-      result = await handler(
-        { agent: { id: 'agent-1' }, messages: [], signal: { aborted: false }, step: 1, ...step },
-        () => ({ kind: 'accept', messages: [] }),
-      )
+      decision = await handler(payload, () => ({ kind: 'accept', messages: [] }))
     }
-    return result ?? { kind: 'accept', messages: [] }
+    decision ??= { kind: 'accept', messages: [] }
+    for (const message of decision.messages ?? []) {
+      // The host appends and then emits the event our listener uses to track the notice.
+      const event = session.append('user/message', message, { surfaceOp: 'append' })
+      await fire('session/event', session, event)
+    }
+    return decision
   }
 
-  return { ctx, tools, emitted, fire, preStep, reads: () => reads, resolveCalls }
+  return { ctx, tools, emitted, appended, session, fire, preStep, reads: () => reads, resolveCalls }
 }
 
 /** Create a temp file bound to a stub host. */
@@ -84,17 +97,17 @@ async function anchorFrom(host, file, toolName = 'read', callId = 'call-1') {
     () => ({ kind: 'accept' }))
 }
 
-/** The texts a pre-step decision would add to the request. */
-function noticesOf(decision) {
-  return (decision.messages ?? []).map(message => message.content[0].text)
+/** The texts the session actually appended. */
+function appendedTexts(host) {
+  return host.appended.map(event => event.data.content[0].text)
 }
 
 test('an untouched file produces no notice and is not re-read', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
   const readsBefore = host.reads()
-  const decision = await host.preStep()
-  assert.deepEqual(noticesOf(decision), [])
+  await host.preStep()
+  assert.deepEqual(appendedTexts(host), [])
   assert.equal(host.reads(), readsBefore, 'the stat prefilter must skip the file read')
 })
 
@@ -103,8 +116,8 @@ test('a touch with identical content refreshes the observation without a notice'
   await anchorFrom(host, file)
   const later = new Date(Date.now() + 5000)
   await utimes(file, later, later)
-  const decision = await host.preStep()
-  assert.deepEqual(noticesOf(decision), [], 'same bytes are not a change')
+  await host.preStep()
+  assert.deepEqual(appendedTexts(host), [], 'same bytes are not a change')
   const observed = host.emitted.filter(([eventName]) => eventName === 'fs/observed')
   assert.ok(observed.length >= 1, 'the refresh emits an observation')
   const readsAfterRefresh = host.reads()
@@ -116,53 +129,102 @@ test('a real change appends one notice naming the file and no hashes', async () 
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
   await writeFile(file, 'a\nCHANGED\n')
-  const decision = await host.preStep()
-  const notices = noticesOf(decision)
-  assert.equal(notices.length, 1)
-  assert.match(notices[0], /\[line-patch\] 1 file has changed since you last read or wrote it/)
-  assert.match(notices[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
-  assert.match(notices[0], /Re-read a file before patching it/)
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1)
+  assert.match(texts[0], /\[line-patch\] 1 file has changed since you last read or wrote it/)
+  assert.match(texts[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
+  assert.match(texts[0], /Re-read a file before patching it/)
   // Handing over the new hash would let a model pair it with stale line numbers.
-  assert.doesNotMatch(notices[0], /file_hash\s+[0-9a-f]{6}\s*->/, 'the notice must not print a hash transition')
-  assert.doesNotMatch(notices[0], /[0-9a-f]{6}/, 'the notice must not print any hash at all')
+  assert.doesNotMatch(texts[0], /[0-9a-f]{6}/, 'the notice must not print any hash at all')
+  assert.equal(host.appended[0].surfaceOp, 'append')
 })
 
-test('the notice is not repeated until the content changes again', async () => {
+test('the notice is not repeated while the stale set is unchanged', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
   await writeFile(file, 'a\nCHANGED\n')
-  assert.equal(noticesOf(await host.preStep()).length, 1)
-  assert.equal(noticesOf(await host.preStep()).length, 0, 'the same new content must not notify twice')
+  await host.preStep()
+  await host.preStep()
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1, 'one live notice, not one per step')
+})
+
+test('a second change to the same file needs no new message', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
   await writeFile(file, 'a\nCHANGED AGAIN\n')
-  assert.equal(noticesOf(await host.preStep()).length, 1, 'a second change notifies again')
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1, 'the stale set is unchanged, so the notice still holds')
+})
+
+test('a newly stale file replaces the live notice instead of appending another', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-rev3-'))
+  const second = join(dir, 'second.txt')
+  await writeFile(second, 'x\ny\n')
+  await anchorFrom(host, file)
+  await anchorFrom(host, second)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  const first = host.appended[0]
+  await writeFile(second, 'x\nCHANGED\n')
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 2)
+  assert.match(texts[1], /2 files have changed/)
+  const replacement = host.appended[1]
+  assert.deepEqual(replacement.surfaceOp, { op: 'replace', startSeq: first.seq, endSeq: first.seq })
+  assert.equal(replacement.sourceEventSeqs[0], first.seq)
+})
+
+test('re-reading the file closes the notice out', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  // The agent re-reads: a fresh anchor replaces the old one.
+  await anchorFrom(host, file, 'read', 'call-2')
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 2)
+  assert.match(texts[1], /No files changed since your last read; earlier line-patch notices no longer apply/)
+  assert.deepEqual(host.appended[1].surfaceOp, { op: 'replace', startSeq: host.appended[0].seq, endSeq: host.appended[0].seq })
+  // Nothing left to say afterwards.
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 2)
 })
 
 test('an older anchor is dropped without a notice', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
   for (let index = 0; index < 4; index += 1) {
-    await host.fire('session/event', null, { type: 'turn/start' })
+    await host.fire('session/event', host.session, { seq: 100 + index, type: 'turn/start' })
   }
   await writeFile(file, 'a\nCHANGED\n')
-  assert.deepEqual(noticesOf(await host.preStep()), [])
+  await host.preStep()
+  assert.deepEqual(appendedTexts(host), [])
 })
 
 test('a write result is tracked too, so its stale hash is announced', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file, 'write')
   await writeFile(file, 'a\nREWRITTEN\n')
-  const notices = noticesOf(await host.preStep())
-  assert.equal(notices.length, 1)
-  assert.match(notices[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
-  assert.doesNotMatch(notices[0], /[0-9a-f]{6}/, 'no hash is disclosed')
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1)
+  assert.match(texts[0], new RegExp(file.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')))
+  assert.doesNotMatch(texts[0], /[0-9a-f]{6}/, 'no hash is disclosed')
 })
 
 test('an aborted step adds no notice', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
   await writeFile(file, 'a\nCHANGED\n')
-  const decision = await host.preStep({ signal: { aborted: true } })
-  assert.deepEqual(noticesOf(decision), [])
+  await host.preStep({ signal: { aborted: true } })
+  assert.deepEqual(appendedTexts(host), [])
 })
 
 test('one line per file even when read and patched both touched it', async () => {
@@ -170,9 +232,8 @@ test('one line per file even when read and patched both touched it', async () =>
   await anchorFrom(host, file, 'read')
   await anchorFrom(host, file, 'patch')
   await writeFile(file, 'a\nCHANGED\n')
-  const notices = noticesOf(await host.preStep())
-  assert.equal(notices.length, 1)
-  const lines = notices[0].split('\n').filter(line => line.startsWith('- '))
+  await host.preStep()
+  const lines = appendedTexts(host)[0].split('\n').filter(line => line.startsWith('- '))
   assert.equal(lines.length, 1, 'the file list is deduplicated')
 })
 
@@ -185,8 +246,9 @@ test('two changed files are reported in one notice', async () => {
   await anchorFrom(host, second)
   await writeFile(file, 'a\nCHANGED\n')
   await writeFile(second, 'x\nCHANGED\n')
-  const notices = noticesOf(await host.preStep())
-  assert.equal(notices.length, 1)
-  assert.match(notices[0], /2 files have changed/)
-  assert.match(notices[0], /second\.txt/)
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1)
+  assert.match(texts[0], /2 files have changed/)
+  assert.match(texts[0], /second\.txt/)
 })
