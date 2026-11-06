@@ -25,12 +25,18 @@ function makeHost() {
   const openSession = (id) => {
     const visible = new Set()
     const events = new Map()
+    // The host exposes surface.nodes as a readonly array, not a Set: the stub
+    // keeps an index for membership but hands the production code the real
+    // shape, so a Set-only implementation cannot pass here.
+    const nodes = []
+    let rejectReplace = false
     const session = {
       id,
-      surface: { nodes: visible },
+      surface: { get nodes() { return [...nodes] } },
       eventAt: (target) => events.get(target),
       append: (type, data, meta = {}) => {
         if (meta.surfaceOp !== undefined && typeof meta.surfaceOp === 'object') {
+          if (rejectReplace) throw new Error('session rejected the replacement')
           const { startSeq, endSeq } = meta.surfaceOp
           if (!visible.has(startSeq) || !visible.has(endSeq)) {
             throw new Error(`surface replace: start seq ${startSeq} not found in surface`)
@@ -39,25 +45,35 @@ function makeHost() {
             throw new Error('surface replace must cite the replaced seq')
           }
           visible.delete(startSeq)
+          const index = nodes.indexOf(startSeq)
+          if (index !== -1) nodes.splice(index, 1)
         }
         seq += 1
         const event = { seq, type, data, sessionId: id, ...meta }
         events.set(seq, event)
         appended.push(event)
         visible.add(seq)
+        nodes.push(seq)
         // The host commits and emits synchronously; the plugin tracks its own
         // notice from this stream, so the stub must do the same.
         queueMicrotask(() => { listeners.get('session/event')?.forEach(handler => handler(session, event)) })
         return event
       },
+      /** Test helper: make every surface replacement fail. */
+      failReplaces: (value = true) => { rejectReplace = value },
       /** Test helper: model a compaction that shadows an existing message. */
-      shadow: (target) => { visible.delete(target) },
+      shadow: (target) => {
+        visible.delete(target)
+        const index = nodes.indexOf(target)
+        if (index !== -1) nodes.splice(index, 1)
+      },
       /** Test helper: put an older line-patch notice on the surface (reload/resume). */
       seedNotice: (text) => {
         seq += 1
         const event = { seq, type: 'user/message', sessionId: id, data: { role: 'user', content: [{ type: 'text', text }], source: { kind: 'line-patch', form: 'notice' } }, surfaceOp: 'append' }
         events.set(seq, event)
         visible.add(seq)
+        nodes.push(seq)
         return event
       },
     }
@@ -426,7 +442,7 @@ test('adoption ignores a user message that is not a notice', async () => {
   const notices = host.appended.filter(event => event.data?.source?.kind === 'line-patch')
   assert.equal(notices.length, 1)
   assert.equal(notices[0].surfaceOp, 'append', 'the user message must not be replaced')
-  assert.ok(host.sessions.get('s1').surface.nodes.has(1), 'the user message is still on the surface')
+  assert.ok(host.sessions.get('s1').surface.nodes.includes(1), 'the user message is still on the surface')
 })
 
 test('a host without session events does not repeat the notice every step', async () => {
@@ -618,6 +634,51 @@ test('a stale queue entry cannot evict the anchor that replaced it', async () =>
   assert.equal(appendedTexts(host).length, 1, 'the live anchor must survive its own stale queue entry')
   assert.match(appendedTexts(host)[0], /sample\.txt/)
 })
+
+test('a rejected replacement falls back to a fresh append', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-rej-'))
+  const second = join(dir, 'second.txt')
+  await writeFile(second, 'x\ny\n')
+  await anchorFrom(host, file)
+  await anchorFrom(host, second)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  // The host refuses the in-place rewrite for a reason other than shadowing
+  // (the node is still on the surface, so noticeStillLive passes).
+  host.sessions.get('s1').failReplaces()
+  await writeFile(second, 'x\nCHANGED\n')
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 2, 'the plugin must not go silent when the rewrite is refused')
+  assert.equal(host.appended[1].surfaceOp, 'append')
+  assert.match(texts[1], /2 files have changed/)
+})
+
+test('another session writing the file does not silence this session', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const annotated = await anchorFrom(host, file)
+  const hash = /(?:^|\n)file_hash: ([0-9a-f]+)$/.exec(annotated.content.at(-1).text)[1]
+  const tools = host.tools.get('patch')
+  // Session s2 rewrites the file through the tool: its own result re-registers
+  // an anchor, and its fs/observed must not delete s1's.
+  await writeFile(file, 'a\nBETA\n')
+  await tools.execute({
+    file_path: file,
+    file_hash: (await import('../lib/core.js')).fileHash('a\nBETA\n'),
+    line_start: 2,
+    start_anchor: 'BETA',
+    line_end: 2,
+    end_anchor: 'BETA',
+    replace: 'GAMMA',
+  }, { agent: { id: 'agent-s2', session: host.sessions.get('s2') }, signal: undefined }).catch(() => {})
+  await host.preStep('s1')
+  const texts = appendedTexts(host, 's1')
+  assert.equal(texts.length, 1, 'the other session\'s write must not drop this session\'s warning')
+  assert.match(texts[0], /sample\.txt/)
+  assert.ok(hash)
+})
+
 
 test('sessions never see each other\'s anchors or notices', async () => {
   const { file, host } = await fixture('a\nb\n')
