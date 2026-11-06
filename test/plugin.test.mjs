@@ -315,7 +315,13 @@ test('patch refuses a stale hash and leaves the file untouched', async () => {
       end_anchor: 'beta',
       replace: 'X',
     }),
-    /file_hash mismatch.*read it again/,
+    (error) => {
+      assert.match(error.message, /file_hash mismatch.*read it again/)
+      // Echoing the current hash would let a retry pair fresh bytes with the
+      // caller's stale line numbers.
+      assert.doesNotMatch(error.message, /[0-9a-f]{6}/, 'the message must not disclose any hash')
+      return true
+    },
   )
   assert.equal(await readFile(file, 'utf8'), content)
 })

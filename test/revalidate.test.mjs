@@ -75,7 +75,12 @@ function makeHost() {
       if (!listeners.has(name)) listeners.set(name, [])
       listeners.get(name).push(handler)
     },
-    emit: (...args) => { emitted.push(args) },
+    // The host dispatches emitted events to the listeners registered for them;
+    // the plugin's own `fs/observed` bookkeeping depends on that.
+    emit: (...args) => {
+      emitted.push(args)
+      for (const handler of listeners.get(args[0]) ?? []) handler(...args.slice(1))
+    },
     waterfall: async (_name, _target, _actor, next) => next(),
     fs: {
       async resolve(p, options = {}) { return { targetKey: p, displayPath: p.split(/[\\/]/).pop() } },
@@ -511,6 +516,41 @@ test('a write in another session leaves the warning intact', async () => {
   )
   await host.preStep('s1')
   assert.equal(appendedTexts(host, 's1').length, 1, 'no false all-clear for the other session')
+})
+
+test('an expired anchor does not silence another file that is still stale', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-mixed-'))
+  const second = join(dir, 'second.txt')
+  await writeFile(second, 'x\ny\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  // The first anchor ages out while a freshly read second file is changed.
+  for (let index = 0; index < 4; index += 1) {
+    await host.fire('session/event', host.sessions.get('s1'), { seq: 400 + index, type: 'turn/start' })
+  }
+  await anchorFrom(host, second)
+  await writeFile(second, 'x\nCHANGED\n')
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 2)
+  assert.match(texts[1], /1 file has changed/)
+  assert.doesNotMatch(texts[1], /No files changed/)
+})
+
+test('a deleted file never triggers the all-clear', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  const { rm } = await import('node:fs/promises')
+  await rm(file)
+  await host.preStep()
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1, 'a vanished file is not a re-read')
+  assert.doesNotMatch(texts[0], /No files changed/)
 })
 
 test('sessions never see each other\'s anchors or notices', async () => {
