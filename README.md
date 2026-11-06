@@ -94,24 +94,31 @@ patch {
 
 只有 `file_hash mismatch` 需要重读；其余错误都在「文件没变」的前提下发生，一轮自纠即可——这正是「一次额外往返 ≈ 一整轮上下文」的价值所在。
 
-## 锚点核实（每轮自动）
+## 漂移检测（每个 step 前自动）
 
-每次 `read` 都会把「文件 hash + 版本」登记下来，之后每次模型请求前（`agent/request`）复核一次，只覆盖**最近 3 个用户回合**内的文件：
+每次 `read`/`write`/`edit`/`patch` 的结果都会把「文件 hash + 版本」登记下来，之后每个模型请求前（`agent/pre-step`）复核一次，只覆盖**最近 3 个用户回合**内的文件：
 
 ```
 stat 预筛（微秒级，不读文件）
 ├─ 版本没变            → 什么都不做
 └─ 版本变了 → 算 file_hash
    ├─ 内容相同（touch / 重新构建） → 只补发 fs/observed 刷新策略底账，上下文零改动
-   └─ 内容真变了                    → 把当初那条 read 结果原地替换成「已失效 + 新旧 hash + 请重读」
+   └─ 内容真变了                    → 在下一个请求里追加一条 notice：
+                                      「这些文件在你读过/写过之后变了（hash A→B），
+                                        之前的行号与 file_hash 作废，改前请重读」
 ```
 
-第二行是关键：内置的 stat 版本守卫会把「内容没变但 mtime 变了」误判为外部修改，这里用内容 hash 纠正它，模型不必因为一次 rebuild 就重读整个文件。
+**不改写任何工具结果**：原来读到的内容仍留在历史里可回看，notice 只是告诉模型「别再用它的行号」。因此 read、write、edit、patch 的 hash 一视同仁地被覆盖；同一份新内容只提醒一次，再变再提醒。
+
+这样做还有个副作用是好的：内置的 stat 版本守卫会把「内容没变但 mtime 变了」误判为外部修改，这里用内容 hash 纠正它，模型不必因为一次 rebuild 就重读整个文件。
+
+> 0.3.1 起改用 `agent/pre-step`。0.3.0 用的 `agent/request` 在 DSH 0.2.2-rc.1 中已被移除，导致漂移检测在 0.2.2 上静默失效；`agent/pre-step` 在 0.2.1 与 0.2.2 上都存在。
 
 ## 实现要点
 
 - 结果标注走宿主全局 waterfall **`tools/post-execute`**：监听 `read`/`write`/`edit`，把 hash 行**并入最后一个 text block**（不新增 block，否则会打断 `dsh-context-archive` 这类要求单 block 的注解插件）；不改写工具本身，也不需要覆盖同名工具（宿主不允许重名注册）。
 - cordis 的 `waterfall` 里 `next()` **不收参数**，最外层监听器的返回值才是宿主应用的结果，所以监听器是 `const d = await next(); return { ...d, content: ... }`。
+- 漂移通知走 **`agent/pre-step`**：监听器 `await next()` 拿到 `{ kind, messages }`，再把一条 user 消息追加到 `messages` 末尾（`createUserMessage`），不改历史。
 - 追加 hash 时插件会按路径**再读一次文件**（页面缓存热），并比对工具自己广播的 `fs/observed` 版本：版本在「工具读取」与「插件复核」之间变过就**不标注**，避免把模型没看过的字节的 hash 交给它。
 - `patch` 的读取与写入走 `ctx.fs`，不直接碰 `node:fs`，沙箱与远端后端仍然有效；相对路径按会话工作目录解析（与内置 fs 工具一致）。
 - 写入复刻内置 `write` 的 intent 舞蹈：`fs/write-intent` waterfall 取意图 → `writeText(intent)` → `emit('fs/observed')`。**裸调 `writeText` 会静默绕过读后写门禁与版本 CAS**。
@@ -130,13 +137,15 @@ stat 预筛（微秒级，不读文件）
 
 另外，0.3.0 新增了 `engines.dsh: ">=0.2.1-rc.1 <0.3.0"`。这不只是元数据：声明了 `engines.dsh` 之后，插件管理器只按这一条判断，`peerDependencies` 不再兜底——装到范围外的宿主上会被直接拒绝。
 
+**0.3.1**：漂移检测从 `agent/request` 迁到 `agent/pre-step`（前者在 DSH 0.2.2-rc.1 已被移除），并从「原地替换旧结果」改成「追加一条通知」，因此 read/write/edit/patch 的 hash 都会被覆盖，且不再改写任何历史内容。工具契约不变，无需迁移。
+
 ## 已验证
 
 0.2.x 在真实宿主上验证过替换、行位移、过期 `file_hash`、`replace: ""` 与 `replaceIfVersion` intent；0.3.0 的 hash 标注、锚点匹配、空白宽容、缩进严格性、短行/空行、EOF/BOF、错误分流由离线测试覆盖。
 
-离线测试：`npm test` — 86 个用例（核心逻辑 55 + 工具胶水 23 + 锚点核实 8），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
+**0.3.0 已在真实宿主（DSH 0.2.1-rc.5）端到端跑通**：`write`/`read` 结果带 `file_hash`，`patch` 成功并回新 hash，旧 hash 报 `FILE_HASH_MISMATCH`，外部改动后旧 read 结果被打上「已改动」。**0.3.1 的漂移通知尚未在真实宿主上验证**（离线测试覆盖）；`agent/pre-step` 的接线按 0.2.1 与 0.2.2-rc.1 的宿主源码核对，两版一致。
 
-0.3.0 **尚未在真实宿主上做端到端验证**：`tools/post-execute` 的行为是按宿主源码（`dsh-tools` 0.2.1-rc.5）核对的，首次装进 desktop profile 时应当先跑一遍 `read` → `patch`。
+离线测试：`npm test` — 86 个用例（核心逻辑 55 + 工具胶水 23 + 漂移检测 8），全部通过。测试桩严格按 cordis waterfall 语义实现（`next()` 不收参数、外层返回值即结果），并断言链路被继续、下游决策被组合、注解落在单个 text block 内。
 
 ## 尚未实现
 
@@ -155,6 +164,8 @@ stat 预筛（微秒级，不读文件）
 
   整文件 hash 对这两种情况同样无能为力（它只证明「文件没变」）。带缩进一起抄能把「只差缩进」的那类行分开（缩进 ≥16 列的行例外，见上文）。
 - 追加 hash 依赖宿主提供 `tools/post-execute`；宿主没有这个 waterfall 时 `read` 不带 hash，`patch` 也就无法使用（不会静默改错）。
+- 漂移通知依赖宿主提供 `agent/pre-step`；没有这个 hook 时插件仍能标注与 patch，但不会提醒「旧 hash 已作废」，只剩 `patch` 的 mismatch 兜底。
+- notice 是**追加到请求末尾的一条 user 消息**，不会重复（同一份新内容只提醒一次）；但它不会修改历史，模型若忽略仍会先撞一次 `FILE_HASH_MISMATCH`。
 - 「版本守卫」只在 provider 广播 `fs/observed` 且带版本时生效；不广播的 provider 上插件会直接标注（此时只剩 `patch` 自己的内容 hash 校验）。
 - **带 hash 的 `read` 结果在 Web UI 里会退化成通用文本卡片**（代码高亮/行号卡片需要结果文本以 `</content>` 结尾，追加的一行破坏了该判定）。只影响显示，不影响模型看到的文本。
 - **PTC（`run_code`）模式拿不到这个 hash**：程序侧只收到工具的 `{ isError, value }`，而内置 `read` 的 value schema（`additionalProperties: false`）里没有 hash 字段，插件无法追加。PTC 会话里请直接用 `edit`/`write`。
