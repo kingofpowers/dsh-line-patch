@@ -123,7 +123,7 @@ function hashOf(decision) {
 
 test('the plugin exports the expected shape', () => {
   assert.equal(name, 'line-patch')
-  assert.deepEqual(inject, ['tools', 'fs'])
+  assert.deepEqual(inject, ['tools', 'fs', 'workingDirectory'])
 })
 
 test('only the patch tool is registered — there is no read_hash', async () => {

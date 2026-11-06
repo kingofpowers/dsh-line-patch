@@ -413,6 +413,22 @@ test('a reload adopts the notice a previous instance left behind', async () => {
   assert.match(replacement.data.content[0].text, /sample\.txt/)
 })
 
+test('adoption ignores a user message that is not a notice', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const session = host.sessions.get('s1')
+  // A plain user message from the model side must never be adopted (and then
+  // rewritten) as if it were our notice.
+  const userMessage = { role: 'user', content: [{ type: 'text', text: 'do not touch me' }], source: { kind: 'user' } }
+  session.append('user/message', userMessage, { surfaceOp: 'append' })
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  const notices = host.appended.filter(event => event.data?.source?.kind === 'line-patch')
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].surfaceOp, 'append', 'the user message must not be replaced')
+  assert.ok(host.sessions.get('s1').surface.nodes.has(1), 'the user message is still on the surface')
+})
+
 test('a host without session events does not repeat the notice every step', async () => {
   const { file, host } = await fixture('a\nb\n')
   await anchorFrom(host, file)
