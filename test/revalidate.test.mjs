@@ -24,8 +24,11 @@ function makeHost() {
 
   const openSession = (id) => {
     const visible = new Set()
+    const events = new Map()
     const session = {
       id,
+      surface: { nodes: visible },
+      eventAt: (target) => events.get(target),
       append: (type, data, meta = {}) => {
         if (meta.surfaceOp !== undefined && typeof meta.surfaceOp === 'object') {
           const { startSeq, endSeq } = meta.surfaceOp
@@ -39,6 +42,7 @@ function makeHost() {
         }
         seq += 1
         const event = { seq, type, data, sessionId: id, ...meta }
+        events.set(seq, event)
         appended.push(event)
         visible.add(seq)
         // The host commits and emits synchronously; the plugin tracks its own
@@ -48,6 +52,14 @@ function makeHost() {
       },
       /** Test helper: model a compaction that shadows an existing message. */
       shadow: (target) => { visible.delete(target) },
+      /** Test helper: put an older line-patch notice on the surface (reload/resume). */
+      seedNotice: (text) => {
+        seq += 1
+        const event = { seq, type: 'user/message', sessionId: id, data: { role: 'user', content: [{ type: 'text', text }], source: { kind: 'line-patch', form: 'notice' } }, surfaceOp: 'append' }
+        events.set(seq, event)
+        visible.add(seq)
+        return event
+      },
     }
     sessions.set(id, session)
     return session
@@ -111,7 +123,7 @@ function makeHost() {
     return decision
   }
 
-  return { ctx, tools, emitted, appended, sessions, fire, preStep, reads: () => reads }
+  return { ctx, tools, emitted, appended, sessions, fire, preStep, reads: () => reads, listeners }
 }
 
 /** Create a temp file bound to a stub host. */
@@ -381,6 +393,50 @@ test('files that share a basename stay separate anchors', async () => {
   await host.preStep()
   const lines = appendedTexts(host)[0].split('\n').filter(line => line.startsWith('- '))
   assert.equal(lines.length, 1, 'only the changed file is reported, even though both are named same.txt')
+})
+
+test('a reload adopts the notice a previous instance left behind', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const seeded = host.sessions.get('s1').seedNotice('[line-patch] 1 file has changed since you last read or wrote it:\n- old.txt\nvoid.')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  // The old notice is rewritten in place, not duplicated.
+  assert.equal(appendedTexts(host).length, 1)
+  const replacement = host.appended[0]
+  assert.deepEqual(replacement.surfaceOp, { op: 'replace', startSeq: seeded.seq, endSeq: seeded.seq })
+  assert.match(replacement.data.content[0].text, /sample\.txt/)
+})
+
+test('a host without session events does not repeat the notice every step', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  await anchorFrom(host, file)
+  await writeFile(file, 'a\nCHANGED\n')
+  host.listeners.delete('session/event')
+  await host.preStep()
+  await host.preStep()
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1)
+})
+
+test('re-reading a file keeps its anchor alive past the eviction window', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-evict-'))
+  await anchorFrom(host, file)
+  // Fill the anchor window with other files, re-read the target, then evict one.
+  for (let index = 0; index < 30; index += 1) {
+    const other = join(dir, `f${index}.txt`)
+    await writeFile(other, `${index}\n`)
+    await anchorFrom(host, other)
+  }
+  await anchorFrom(host, file, 'read', 's1', 'call-reread')
+  const extra = join(dir, 'f31.txt')
+  await writeFile(extra, 'x\n')
+  await anchorFrom(host, extra)
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1, 'the re-read anchor must not be evicted by its own stale queue entry')
+  assert.match(appendedTexts(host)[0], /sample\.txt/)
 })
 
 test('sessions never see each other\'s anchors or notices', async () => {
