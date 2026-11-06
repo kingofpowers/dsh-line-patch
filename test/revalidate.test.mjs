@@ -569,6 +569,56 @@ test('a deleted file never triggers the all-clear', async () => {
   assert.doesNotMatch(texts[0], /No files changed/)
 })
 
+test('a same-named file in another directory is not evidence of a re-read', async () => {
+  const dirA = await mkdtemp(join(tmpdir(), 'line-patch-ev-a-'))
+  const dirB = await mkdtemp(join(tmpdir(), 'line-patch-ev-b-'))
+  const fileA = join(dirA, 'same.txt')
+  const fileB = join(dirB, 'same.txt')
+  await writeFile(fileA, 'a\nb\n')
+  await writeFile(fileB, 'x\ny\n')
+  const { host } = await fixture('unused\n')
+  await anchorFrom(host, fileA)
+  await writeFile(fileA, 'a\nCHANGED\n')
+  await host.preStep()
+  // The first anchor ages out; the model then reads the *other* same-named
+  // file. That is not evidence that the first one was re-read.
+  for (let index = 0; index < 4; index += 1) {
+    await host.fire('session/event', host.sessions.get('s1'), { seq: 500 + index, type: 'turn/start' })
+  }
+  await anchorFrom(host, fileB)
+  await host.preStep()
+  const texts = appendedTexts(host)
+  assert.equal(texts.length, 1, 'the warning must not be closed out by a different file')
+  assert.doesNotMatch(texts[0], /No files changed/)
+})
+
+test('a stale queue entry cannot evict the anchor that replaced it', async () => {
+  const { file, host } = await fixture('a\nb\n')
+  const dir = await mkdtemp(join(tmpdir(), 'line-patch-ev2-'))
+  await anchorFrom(host, file)
+  // Age the anchor out; it leaves `anchors` but keeps its queue entry.
+  for (let index = 0; index < 4; index += 1) {
+    await host.fire('session/event', host.sessions.get('s1'), { seq: 600 + index, type: 'turn/start' })
+  }
+  // Push the stale entry away from the head, then re-read the file so a fresh
+  // anchor sits behind it.
+  for (let index = 0; index < 20; index += 1) {
+    const other = join(dir, `o${index}.txt`)
+    await writeFile(other, `${index}\n`)
+    await anchorFrom(host, other)
+  }
+  await anchorFrom(host, file, 'read', 's1', 'call-fresh')
+  for (let index = 0; index < 14; index += 1) {
+    const other = join(dir, `g${index}.txt`)
+    await writeFile(other, `${index}\n`)
+    await anchorFrom(host, other)
+  }
+  await writeFile(file, 'a\nCHANGED\n')
+  await host.preStep()
+  assert.equal(appendedTexts(host).length, 1, 'the live anchor must survive its own stale queue entry')
+  assert.match(appendedTexts(host)[0], /sample\.txt/)
+})
+
 test('sessions never see each other\'s anchors or notices', async () => {
   const { file, host } = await fixture('a\nb\n')
   const dir = await mkdtemp(join(tmpdir(), 'line-patch-rev4-'))
